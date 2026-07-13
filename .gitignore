@@ -1,0 +1,27 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# IDE and user-specific files
+.idea/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test and coverage output
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+appsettings.*.local.json
+
+# OS files
+.DS_Store
+Thumbs.db
