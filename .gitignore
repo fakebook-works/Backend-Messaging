@@ -1,6 +1,7 @@
 # Build output
 [Bb]in/
 [Oo]bj/
+.artifacts/
 
 # IDE and user-specific files
 .idea/

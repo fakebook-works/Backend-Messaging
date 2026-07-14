@@ -1,6 +1,45 @@
-@MessengerService_HostAddress = http://localhost:5079
+@Messaging_HostAddress = http://localhost:5013
+@GatewaySecret = replace-with-at-least-32-bytes
+@InternalSecret = replace-with-at-least-32-bytes
+@UserId = 1
 
-GET {{MessengerService_HostAddress}}/weatherforecast/
+GET {{Messaging_HostAddress}}/health/live
 Accept: application/json
 
 ###
+
+GET {{Messaging_HostAddress}}/health/ready
+Accept: application/json
+
+###
+
+POST {{Messaging_HostAddress}}/internal/users
+Content-Type: application/json
+X-Internal-MessengerService-Secret: {{InternalSecret}}
+
+{
+  "userId": {{UserId}}
+}
+
+###
+
+POST {{Messaging_HostAddress}}/graphql
+Content-Type: application/json
+X-Gateway-Secret: {{GatewaySecret}}
+X-User-Id: {{UserId}}
+
+{
+  "query": "query MyConversations { myConversations { items { id type title participants { userId user { id } } } pageInfo { endCursor hasNextPage } } }"
+}
+
+### GraphQL over SSE (keep the connection open)
+
+POST {{Messaging_HostAddress}}/graphql
+Accept: text/event-stream
+Content-Type: application/json
+X-Gateway-Secret: {{GatewaySecret}}
+X-User-Id: {{UserId}}
+
+{
+  "query": "subscription InboxEvents { inboxEvents { eventId kind conversationId messageId occurredAt } }"
+}
