@@ -3,7 +3,7 @@
   "transports": {
     "http": {
       "url": "{{MESSAGING_URL}}",
-      "clientName": "fusion",
+      "clientName": "messaging-fusion",
       "capabilities": {
         "subscriptions": {
           "supported": true,
@@ -16,10 +16,10 @@
   },
   "environments": {
     "Development": {
-      "MESSAGING_URL": "http://localhost:5013/graphql"
+      "MESSAGING_URL": "http://localhost:1006/graphql"
     },
     "Production": {
-      "MESSAGING_URL": "http://messaging:5013/graphql"
+      "MESSAGING_URL": "http://messaging:1006/graphql"
     }
   }
 }

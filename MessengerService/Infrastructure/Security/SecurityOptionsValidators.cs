@@ -26,6 +26,13 @@ public sealed class InternalServicesOptionsValidator : IValidateOptions<Internal
                 $"{FixedTimeSecretComparer.MinimumSecretBytes} UTF-8 bytes.");
         }
 
+        if (!FixedTimeSecretComparer.IsStrongEnough(options.SocialGraph.SharedSecret))
+        {
+            failures.Add(
+                $"{InternalServicesOptions.SectionName}:SocialGraph:SharedSecret must contain at least " +
+                $"{FixedTimeSecretComparer.MinimumSecretBytes} UTF-8 bytes.");
+        }
+
         if (options.TimeoutSeconds <= 0)
         {
             failures.Add($"{InternalServicesOptions.SectionName}:TimeoutSeconds must be greater than zero.");

@@ -10,7 +10,7 @@ the following companion-service changes.
 ```http
 POST /internal/messaging/permissions/check
 Content-Type: application/json
-X-Internal-MessengerService-Secret: <shared Messaging/SocialGraph secret>
+X-Internal-SocialGraphService-Secret: <SocialGraph service secret>
 X-Correlation-ID: <correlation id>
 ```
 

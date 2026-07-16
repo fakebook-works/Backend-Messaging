@@ -91,6 +91,9 @@ public sealed class GatewayTrustMiddleware(
 
         if (!isActive)
         {
+            logger.LogWarning(
+                "Rejected trusted Messaging request because user {UserId} is not active.",
+                userId);
             await SecurityProblemWriter.WriteAsync(
                 context,
                 StatusCodes.Status403Forbidden,

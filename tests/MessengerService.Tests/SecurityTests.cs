@@ -53,7 +53,11 @@ public sealed class SecurityOptionsValidatorTests
             {
                 MessengerSharedSecret = StrongSecret,
                 TimeoutSeconds = 3,
-                SocialGraph = new SocialGraphOptions { BaseUrl = "https://socialgraph:5012" }
+                SocialGraph = new SocialGraphOptions
+                {
+                    BaseUrl = "https://socialgraph:5012",
+                    SharedSecret = StrongSecret
+                }
             });
 
         Assert.True(result.Succeeded);
@@ -68,11 +72,15 @@ public sealed class SecurityOptionsValidatorTests
             {
                 MessengerSharedSecret = "weak",
                 TimeoutSeconds = 0,
-                SocialGraph = new SocialGraphOptions { BaseUrl = "file:///tmp/social" }
+                SocialGraph = new SocialGraphOptions
+                {
+                    BaseUrl = "file:///tmp/social",
+                    SharedSecret = "weak"
+                }
             });
 
         Assert.True(result.Failed);
-        Assert.Equal(3, result.Failures.Count());
+        Assert.Equal(4, result.Failures.Count());
     }
 }
 

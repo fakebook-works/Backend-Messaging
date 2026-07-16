@@ -8,7 +8,9 @@ REST endpoints.
 ## Trust boundaries
 
 - Gateway GraphQL calls must include trusted `X-Gateway-Secret` and `X-User-Id` headers.
-- Internal SocialGraph calls must include `X-Internal-MessengerService-Secret`.
+- Inbound SocialGraph provisioning calls must include `X-Internal-MessengerService-Secret`.
+- Outbound permission checks to SocialGraph use the separate
+  `InternalServices:SocialGraph:SharedSecret` in `X-Internal-SocialGraphService-Secret`.
 - Secrets and the PostgreSQL connection string are required configuration and are never
   committed. Start from `.env.example` or use .NET User Secrets.
 - Attachment bodies are not accepted. Messaging only stores absolute HTTPS URLs whose

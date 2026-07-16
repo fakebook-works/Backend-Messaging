@@ -13,7 +13,7 @@ namespace MessengerService.Tests;
 
 public sealed class SocialGraphPermissionClientTests
 {
-    private const string StrongSecret = "0123456789abcdef0123456789abcdef";
+    private const string SocialGraphSecret = "socialgraph-secret-0123456789abcdef";
 
     [Fact]
     public async Task CheckAsync_SendsTrustedContractAndReturnsDecisions()
@@ -53,8 +53,9 @@ public sealed class SocialGraphPermissionClientTests
             "https://social.example/internal/messaging/permissions/check",
             handler.LastRequestUri!.AbsoluteUri);
         Assert.Equal(
-            StrongSecret,
-            Assert.Single(handler.LastHeaders[MessagingHeaders.InternalServiceSecret]));
+            SocialGraphSecret,
+            Assert.Single(handler.LastHeaders[MessagingHeaders.SocialGraphServiceSecret]));
+        Assert.False(handler.LastHeaders.ContainsKey(MessagingHeaders.InternalServiceSecret));
         Assert.Equal(
             "correlation-test",
             Assert.Single(handler.LastHeaders[MessagingHeaders.CorrelationId]));
@@ -163,7 +164,7 @@ public sealed class SocialGraphPermissionClientTests
     private static SocialGraphPermissionClient CreateClient(
         StubHttpMessageHandler handler,
         string baseUrl = "https://social.example",
-        string secret = StrongSecret)
+        string secret = SocialGraphSecret)
     {
         var context = new DefaultHttpContext
         {
@@ -174,9 +175,13 @@ public sealed class SocialGraphPermissionClientTests
             new HttpClient(handler),
             Options.Create(new InternalServicesOptions
             {
-                MessengerSharedSecret = secret,
+                MessengerSharedSecret = "messenger-inbound-secret-0123456789ab",
                 TimeoutSeconds = 1,
-                SocialGraph = new SocialGraphOptions { BaseUrl = baseUrl }
+                SocialGraph = new SocialGraphOptions
+                {
+                    BaseUrl = baseUrl,
+                    SharedSecret = secret
+                }
             }),
             new HttpContextAccessor { HttpContext = context },
             NullLogger<SocialGraphPermissionClient>.Instance);

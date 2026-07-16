@@ -40,7 +40,7 @@ public sealed class SocialGraphPermissionClient(
 
         var currentOptions = options.Value;
         if (!TryBuildEndpoint(currentOptions.SocialGraph.BaseUrl, out var endpoint) ||
-            !FixedTimeSecretComparer.IsStrongEnough(currentOptions.MessengerSharedSecret) ||
+            !FixedTimeSecretComparer.IsStrongEnough(currentOptions.SocialGraph.SharedSecret) ||
             currentOptions.TimeoutSeconds <= 0)
         {
             logger.LogCritical("The SocialGraph permission client is not configured safely.");
@@ -57,8 +57,8 @@ public sealed class SocialGraphPermissionClient(
                 options: SerializerOptions)
         };
         request.Headers.TryAddWithoutValidation(
-            MessagingHeaders.InternalServiceSecret,
-            currentOptions.MessengerSharedSecret);
+            MessagingHeaders.SocialGraphServiceSecret,
+            currentOptions.SocialGraph.SharedSecret);
         request.Headers.TryAddWithoutValidation(
             MessagingHeaders.CorrelationId,
             ResolveCorrelationId());

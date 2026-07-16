@@ -14,4 +14,6 @@ public sealed class InternalServicesOptions
 public sealed class SocialGraphOptions
 {
     public string BaseUrl { get; set; } = string.Empty;
+
+    public string SharedSecret { get; set; } = string.Empty;
 }
