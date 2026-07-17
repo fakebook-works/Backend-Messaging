@@ -57,6 +57,11 @@ public sealed class SecurityOptionsValidatorTests
                 {
                     BaseUrl = "https://socialgraph:5012",
                     SharedSecret = StrongSecret
+                },
+                Upload = new UploadOptions
+                {
+                    BaseUrl = "https://upload:4001",
+                    SharedSecret = StrongSecret
                 }
             });
 
@@ -76,11 +81,16 @@ public sealed class SecurityOptionsValidatorTests
                 {
                     BaseUrl = "file:///tmp/social",
                     SharedSecret = "weak"
+                },
+                Upload = new UploadOptions
+                {
+                    BaseUrl = "file:///tmp/upload",
+                    SharedSecret = "weak"
                 }
             });
 
         Assert.True(result.Failed);
-        Assert.Equal(4, result.Failures.Count());
+        Assert.Equal(6, result.Failures.Count());
     }
 }
 

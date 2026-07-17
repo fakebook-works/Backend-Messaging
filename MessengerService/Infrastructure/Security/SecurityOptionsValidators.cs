@@ -33,6 +33,13 @@ public sealed class InternalServicesOptionsValidator : IValidateOptions<Internal
                 $"{FixedTimeSecretComparer.MinimumSecretBytes} UTF-8 bytes.");
         }
 
+        if (!FixedTimeSecretComparer.IsStrongEnough(options.Upload.SharedSecret))
+        {
+            failures.Add(
+                $"{InternalServicesOptions.SectionName}:Upload:SharedSecret must contain at least " +
+                $"{FixedTimeSecretComparer.MinimumSecretBytes} UTF-8 bytes.");
+        }
+
         if (options.TimeoutSeconds <= 0)
         {
             failures.Add($"{InternalServicesOptions.SectionName}:TimeoutSeconds must be greater than zero.");
@@ -43,6 +50,13 @@ public sealed class InternalServicesOptionsValidator : IValidateOptions<Internal
         {
             failures.Add(
                 $"{InternalServicesOptions.SectionName}:SocialGraph:BaseUrl must be an absolute HTTP(S) URL.");
+        }
+
+        if (!Uri.TryCreate(options.Upload.BaseUrl, UriKind.Absolute, out var uploadBaseUri) ||
+            (uploadBaseUri.Scheme != Uri.UriSchemeHttp && uploadBaseUri.Scheme != Uri.UriSchemeHttps))
+        {
+            failures.Add(
+                $"{InternalServicesOptions.SectionName}:Upload:BaseUrl must be an absolute HTTP(S) URL.");
         }
 
         return failures.Count == 0

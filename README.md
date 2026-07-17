@@ -11,10 +11,13 @@ REST endpoints.
 - Inbound SocialGraph provisioning calls must include `X-Internal-MessengerService-Secret`.
 - Outbound permission checks to SocialGraph use the separate
   `InternalServices:SocialGraph:SharedSecret` in `X-Internal-SocialGraphService-Secret`.
+- Outbound attachment lifecycle calls use `InternalServices:Upload:BaseUrl` and
+  `InternalServices:Upload:SharedSecret` in `X-Internal-UploadService-Secret`.
 - Secrets and the PostgreSQL connection string are required configuration and are never
   committed. Start from `.env.example` or use .NET User Secrets.
-- Attachment bodies are not accepted. Messaging only stores absolute HTTPS URLs whose
-  hosts are present in `Messaging:AllowedAttachmentHosts`.
+- Attachment bodies are not accepted. Messaging stores either safe same-origin
+  `/media/files/{leaf}` URLs or absolute HTTPS URLs whose hosts are present in
+  `Messaging:AllowedAttachmentHosts`.
 
 ## Local commands
 
@@ -40,6 +43,15 @@ Realtime events are at-least-once invalidation hints. A retry or multiple servic
 replicas can produce duplicates or deliver later conversation events first. Clients must
 deduplicate by `eventId`, apply message `sequence` monotonically, and refetch the
 conversation/messages when a sequence gap is observed.
+
+The transactional outbox also owns staged attachment lifecycle. A successful message
+commit queues `media.finalize.v1`; deleting the final non-deleted message that references
+a URL queues `media.delete.v1`. Upload calls retry with exponential backoff, so closing a
+browser immediately after send cannot leave a persisted message pointing at an expiring
+pending asset. Frontend owner-finalization remains safe but is no longer the only guard.
+When the outbox is empty, polling backs off from `Messaging:OutboxPollMilliseconds` to
+`Messaging:OutboxMaxIdlePollMilliseconds` and resets after the next dispatched event,
+reducing idle traffic to an external PostgreSQL server.
 
 ## Internal user lifecycle
 

@@ -16,6 +16,8 @@ public sealed class MessagingOptions
 
     public int OutboxPollMilliseconds { get; set; } = 250;
 
+    public int OutboxMaxIdlePollMilliseconds { get; set; } = 2_000;
+
     public int OutboxRetentionHours { get; set; } = 24;
 
     public int OutboxCleanupIntervalMinutes { get; set; } = 30;
@@ -46,6 +48,12 @@ public sealed class MessagingOptionsValidator : IValidateOptions<MessagingOption
         if (options.OutboxPollMilliseconds is < 50 or > 60_000)
         {
             failures.Add("Messaging:OutboxPollMilliseconds must be between 50 and 60000.");
+        }
+
+        if (options.OutboxMaxIdlePollMilliseconds is < 50 or > 60_000 ||
+            options.OutboxMaxIdlePollMilliseconds < options.OutboxPollMilliseconds)
+        {
+            failures.Add("Messaging:OutboxMaxIdlePollMilliseconds must be between OutboxPollMilliseconds and 60000.");
         }
 
         if (options.OutboxRetentionHours is < 1 or > 720)

@@ -1,5 +1,7 @@
 using System.Text.Json;
 using HotChocolate.Subscriptions;
+using MessengerService.Application.Abstractions;
+using MessengerService.Application.Media;
 using MessengerService.Application.Realtime;
 using MessengerService.Configuration;
 using MessengerService.Infrastructure.Persistence;
@@ -11,6 +13,7 @@ namespace MessengerService.Infrastructure.Realtime;
 public sealed class OutboxDispatcher(
     IServiceScopeFactory scopeFactory,
     ITopicEventSender eventSender,
+    IUploadMediaClient uploadMediaClient,
     IOptions<MessagingOptions> options,
     ILogger<OutboxDispatcher> logger) : BackgroundService
 {
@@ -20,6 +23,10 @@ public sealed class OutboxDispatcher(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var pollMilliseconds = options.Value.OutboxPollMilliseconds;
+        var maxIdlePollMilliseconds = options.Value.OutboxMaxIdlePollMilliseconds;
+        var idlePollMilliseconds = pollMilliseconds;
+
         while (!stoppingToken.IsCancellationRequested)
         {
             var dispatched = 0;
@@ -40,7 +47,12 @@ public sealed class OutboxDispatcher(
 
             if (dispatched == 0)
             {
-                await Task.Delay(options.Value.OutboxPollMilliseconds, stoppingToken);
+                await Task.Delay(idlePollMilliseconds, stoppingToken);
+                idlePollMilliseconds = Math.Min(maxIdlePollMilliseconds, idlePollMilliseconds * 2);
+            }
+            else
+            {
+                idlePollMilliseconds = pollMilliseconds;
             }
         }
     }
@@ -69,11 +81,26 @@ public sealed class OutboxDispatcher(
         {
             try
             {
-                var payload = JsonSerializer.Deserialize<RealtimeEvent>(
-                    outboxEvent.PayloadJson,
-                    JsonOptions) ?? throw new JsonException("The outbox payload is empty.");
+                if (outboxEvent.Kind is MediaLifecycleEventKinds.Finalize or MediaLifecycleEventKinds.Delete)
+                {
+                    var mediaPayload = MediaLifecycleOutbox.Deserialize(outboxEvent.PayloadJson);
+                    if (outboxEvent.Kind == MediaLifecycleEventKinds.Finalize)
+                    {
+                        await uploadMediaClient.FinalizeAsync(mediaPayload.Urls, cancellationToken);
+                    }
+                    else
+                    {
+                        await uploadMediaClient.DeleteAsync(mediaPayload.Urls, cancellationToken);
+                    }
+                }
+                else
+                {
+                    var payload = JsonSerializer.Deserialize<RealtimeEvent>(
+                        outboxEvent.PayloadJson,
+                        JsonOptions) ?? throw new JsonException("The outbox payload is empty.");
 
-                await eventSender.SendAsync(outboxEvent.Topic, payload, cancellationToken);
+                    await eventSender.SendAsync(outboxEvent.Topic, payload, cancellationToken);
+                }
                 outboxEvent.ProcessedAt = DateTimeOffset.UtcNow;
                 outboxEvent.LastError = null;
                 outboxEvent.NextAttemptAt = null;

@@ -9,9 +9,18 @@ public sealed class InternalServicesOptions
     public int TimeoutSeconds { get; set; } = 3;
 
     public SocialGraphOptions SocialGraph { get; set; } = new();
+
+    public UploadOptions Upload { get; set; } = new();
 }
 
 public sealed class SocialGraphOptions
+{
+    public string BaseUrl { get; set; } = string.Empty;
+
+    public string SharedSecret { get; set; } = string.Empty;
+}
+
+public sealed class UploadOptions
 {
     public string BaseUrl { get; set; } = string.Empty;
 

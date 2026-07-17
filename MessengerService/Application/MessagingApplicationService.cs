@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Diagnostics.CodeAnalysis;
 using MessengerService.Application.Abstractions;
 using MessengerService.Application.Models;
+using MessengerService.Application.Media;
 using MessengerService.Application.Realtime;
 using MessengerService.Domain.Entities;
 using MessengerService.Domain.Enums;
@@ -534,6 +535,17 @@ public sealed class MessagingApplicationService(
         var ev = NewEvent(RealtimeEventKinds.MessageAdded, now, conversation.Id, message.Id,
             actorUserId, message.Sequence);
         EnqueueEvent(ev, [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
+        var finalizeMediaEvent = MediaLifecycleOutbox.Create(
+            MediaLifecycleEventKinds.Finalize,
+            command.AttachmentUrls,
+            now,
+            conversation.Id,
+            message.Id,
+            actorUserId);
+        if (finalizeMediaEvent is not null)
+        {
+            db.OutboxEvents.Add(finalizeMediaEvent);
+        }
         try
         {
             await db.SaveChangesAsync(cancellationToken);
@@ -623,9 +635,37 @@ public sealed class MessagingApplicationService(
         if (message.DeletedAt is null)
         {
             var now = timeProvider.GetUtcNow();
+            var attachmentUrls = await db.MessageAttachments
+                .AsNoTracking()
+                .Where(attachment => attachment.MessageId == message.Id)
+                .Select(attachment => attachment.Url)
+                .Distinct()
+                .ToArrayAsync(cancellationToken);
+            var sharedUrls = attachmentUrls.Length == 0
+                ? []
+                : await db.MessageAttachments
+                    .AsNoTracking()
+                    .Where(attachment =>
+                        attachment.MessageId != message.Id &&
+                        attachmentUrls.Contains(attachment.Url) &&
+                        attachment.Message.DeletedAt == null)
+                    .Select(attachment => attachment.Url)
+                    .Distinct()
+                    .ToArrayAsync(cancellationToken);
             message.DeletedAt = now;
             EnqueueEvent(NewEvent(RealtimeEventKinds.MessageDeleted, now, message.ConversationId,
                 message.Id, actorUserId, message.Sequence), RealtimeTopics.Conversation(message.ConversationId));
+            var deleteMediaEvent = MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Delete,
+                attachmentUrls.Except(sharedUrls, StringComparer.OrdinalIgnoreCase),
+                now,
+                message.ConversationId,
+                message.Id,
+                actorUserId);
+            if (deleteMediaEvent is not null)
+            {
+                db.OutboxEvents.Add(deleteMediaEvent);
+            }
             await db.SaveChangesAsync(cancellationToken);
         }
 
@@ -1213,13 +1253,13 @@ public sealed class MessagingApplicationService(
 
     private void ValidateMediaUrl(string value)
     {
-        if (value.Length > _rules.MaxAttachmentUrlLength ||
-            !Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
-            uri.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(uri.Host) ||
-            !_rules.AllowedAttachmentHosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase))
+        if (!AttachmentUrlPolicy.IsAllowed(
+                value,
+                _rules.MaxAttachmentUrlLength,
+                _rules.AllowedAttachmentHosts))
         {
             Throw(MessagingErrorCodes.AttachmentUrlNotAllowed,
-                "Media URLs must use HTTPS and an explicitly allowed host.");
+                "Media URLs must be a managed /media/files path or use HTTPS and an explicitly allowed host.");
         }
     }
 

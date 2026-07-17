@@ -76,6 +76,9 @@ builder.Services.AddSingleton<ISubscriptionAuthorizationChecker, SubscriptionAut
 builder.Services
     .AddHttpClient<ISocialGraphPermissionClient, SocialGraphPermissionClient>(client =>
         client.Timeout = Timeout.InfiniteTimeSpan);
+builder.Services
+    .AddHttpClient<IUploadMediaClient, UploadMediaClient>(client =>
+        client.Timeout = Timeout.InfiniteTimeSpan);
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
