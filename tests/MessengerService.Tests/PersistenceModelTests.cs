@@ -77,9 +77,18 @@ public sealed class PersistenceModelTests
         Assert.Equal(
             2048,
             attachment.FindProperty(nameof(MessageAttachment.Url))!.GetMaxLength());
-        Assert.Contains(
+        var urlConstraint = Assert.Single(
             attachment.GetCheckConstraints(),
             constraint => constraint.Name == "ck_message_attachments_https_url");
+        Assert.Contains("/media/files/", urlConstraint.Sql, StringComparison.Ordinal);
+        Assert.Contains("https://", urlConstraint.Sql, StringComparison.Ordinal);
+        Assert.Equal(128, attachment.FindProperty(nameof(MessageAttachment.AssetId))!.GetMaxLength());
+        Assert.Equal(16, attachment.FindProperty(nameof(MessageAttachment.MediaType))!.GetMaxLength());
+        Assert.Equal(128, attachment.FindProperty(nameof(MessageAttachment.ContentType))!.GetMaxLength());
+        Assert.Equal(255, attachment.FindProperty(nameof(MessageAttachment.OriginalName))!.GetMaxLength());
+        Assert.Equal(2048, attachment.FindProperty(nameof(MessageAttachment.ThumbnailUrl))!.GetMaxLength());
+        Assert.Contains(attachment.GetCheckConstraints(), constraint => constraint.Name == "ck_message_attachments_media_type");
+        Assert.Contains(attachment.GetCheckConstraints(), constraint => constraint.Name == "ck_message_attachments_metadata_nonnegative");
         Assert.Contains(
             participant.GetCheckConstraints(),
             constraint => constraint.Name == "ck_conversation_participants_receipts");

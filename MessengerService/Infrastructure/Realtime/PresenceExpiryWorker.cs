@@ -11,6 +11,7 @@ namespace MessengerService.Infrastructure.Realtime;
 public sealed class PresenceExpiryWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<MessagingOptions> options,
+    OutboxWakeSignal wakeSignal,
     ILogger<PresenceExpiryWorker> logger) : BackgroundService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -59,7 +60,6 @@ public sealed class PresenceExpiryWorker(
         foreach (var presence in stale)
         {
             presence.IsOnline = false;
-            presence.UpdatedAt = now;
 
             var realtimeEvent = new RealtimeEvent(
                 Guid.NewGuid(),
@@ -88,5 +88,9 @@ public sealed class PresenceExpiryWorker(
         }
 
         await transaction.CommitAsync(cancellationToken);
+        if (stale.Count > 0)
+        {
+            wakeSignal.Pulse();
+        }
     }
 }

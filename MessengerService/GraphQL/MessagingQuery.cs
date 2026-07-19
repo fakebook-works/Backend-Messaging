@@ -15,6 +15,14 @@ public sealed class MessagingQuery
         CancellationToken cancellationToken = default) =>
         messaging.GetMyConversationsAsync(userContext.RequireUserId(), first, after, cancellationToken);
 
+    public Task<ConversationPage> MyDirectConversations(
+        int first = 40,
+        string? after = null,
+        [Service] MessagingApplicationService messaging = default!,
+        [Service] ITrustedUserContextAccessor userContext = default!,
+        CancellationToken cancellationToken = default) =>
+        messaging.GetMyDirectConversationsAsync(userContext.RequireUserId(), first, after, cancellationToken);
+
     public Task<ConversationView> Conversation(
         Guid id,
         [Service] MessagingApplicationService messaging,
@@ -30,6 +38,13 @@ public sealed class MessagingQuery
         [Service] ITrustedUserContextAccessor userContext = default!,
         CancellationToken cancellationToken = default) =>
         messaging.GetMessagesAsync(userContext.RequireUserId(), conversationId, last, before, cancellationToken);
+
+    public Task<MessageView> Message(
+        Guid id,
+        [Service] MessagingApplicationService messaging,
+        [Service] ITrustedUserContextAccessor userContext,
+        CancellationToken cancellationToken) =>
+        messaging.GetMessageAsync(userContext.RequireUserId(), id, cancellationToken);
 
     public Task<IReadOnlyList<UserPresenceView>> UserPresence(
         IReadOnlyList<long> userIds,

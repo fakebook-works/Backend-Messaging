@@ -73,7 +73,18 @@ public sealed class MessagingMutation
         CancellationToken cancellationToken) =>
         messaging.SendMessageAsync(userContext.RequireUserId(),
             new SendMessageCommand(input.ConversationId, input.ClientMessageId, input.Text,
-                input.AttachmentUrls ?? [], input.ReplyToMessageId), cancellationToken);
+                input.AttachmentUrls ?? [], input.ReplyToMessageId,
+                input.Attachments?.Select(attachment => new MessageAttachmentCommand(
+                    attachment.Url,
+                    attachment.AssetId,
+                    attachment.MediaType,
+                    attachment.ContentType,
+                    attachment.OriginalName,
+                    attachment.SizeBytes,
+                    attachment.Width,
+                    attachment.Height,
+                    attachment.DurationMs,
+                    attachment.ThumbnailUrl)).ToArray()), cancellationToken);
 
     public Task<MessageView> EditMessage(
         EditMessageInput input,

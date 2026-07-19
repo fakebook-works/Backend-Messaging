@@ -4,6 +4,8 @@ public sealed record CreateInternalUserRequest(long UserId);
 
 public sealed record InternalUserResponse(long UserId);
 
+public sealed record DirectContactIdsResponse(IReadOnlyList<long> UserIds);
+
 public enum ProvisionUserOutcome
 {
     Created,

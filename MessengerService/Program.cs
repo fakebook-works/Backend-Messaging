@@ -71,8 +71,10 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<ITrustedUserContextAccessor, TrustedUserContextAccessor>();
 builder.Services.AddScoped<IMessagingUserProvisioningService, MessagingUserProvisioningService>();
+builder.Services.AddScoped<DirectContactQueryService>();
 builder.Services.AddScoped<MessagingApplicationService>();
 builder.Services.AddSingleton<ISubscriptionAuthorizationChecker, SubscriptionAuthorizationChecker>();
+builder.Services.AddSingleton<OutboxWakeSignal>();
 builder.Services
     .AddHttpClient<ISocialGraphPermissionClient, SocialGraphPermissionClient>(client =>
         client.Timeout = Timeout.InfiniteTimeSpan);

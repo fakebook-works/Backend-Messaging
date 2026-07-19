@@ -1,3 +1,8 @@
+# Messenger database schema
+
+Schema PostgreSQL hiện tại của Messenger Service. Media của tin nhắn được lưu dưới dạng một attachment snapshot; Upload Server vẫn là nơi quản lý file vật lý và vòng đời pending/committed.
+
+```sql
 create table "__EFMigrationsHistory"
 (
 "MigrationId"    varchar(150) not null
@@ -222,16 +227,29 @@ where (is_online = true);
 
 create table message_attachments
 (
-message_id uuid          not null
+message_id    uuid          not null
 constraint fk_message_attachments_messages
 references messages
 on delete cascade,
-ordinal    integer       not null
+ordinal       integer       not null
 constraint ck_message_attachments_ordinal
 check ((ordinal >= 0) AND (ordinal < 10)),
-url        varchar(2048) not null
+url           varchar(2048) not null
 constraint ck_message_attachments_https_url
-check ((url)::text ~~ 'https://%'::text),
+check (((url)::text ~~ '/media/files/%'::text) OR ((url)::text ~~ 'https://%'::text)),
+asset_id      varchar(128),
+media_type    varchar(16),
+content_type  varchar(128),
+original_name varchar(255),
+size_bytes    bigint,
+width         integer,
+height        integer,
+duration_ms   bigint,
+thumbnail_url varchar(2048),
+constraint ck_message_attachments_media_type
+check ((media_type IS NULL) OR ((media_type)::text = ANY ((ARRAY ['image'::character varying, 'video'::character varying, 'audio'::character varying, 'file'::character varying])::text[]))),
+constraint ck_message_attachments_metadata_nonnegative
+check (((size_bytes IS NULL) OR (size_bytes >= 0)) AND ((width IS NULL) OR (width >= 0)) AND ((height IS NULL) OR (height >= 0)) AND ((duration_ms IS NULL) OR (duration_ms >= 0))),
 constraint pk_message_attachments
 primary key (message_id, ordinal)
 );
@@ -267,3 +285,14 @@ owner to fakebook;
 
 create index ix_message_reactions_user_id
 on message_reactions (user_id);
+```
+
+## Quy ước attachment
+
+- Một message có tối đa 10 attachment; `ordinal` giữ nguyên thứ tự người gửi đã chọn.
+- `url` chấp nhận managed path `/media/files/...` hoặc HTTPS URL đã được Messenger Service kiểm tra host. HTTP URL bên ngoài không được chấp nhận.
+- `asset_id` liên kết attachment với asset do Upload Server tạo, phục vụ finalize/delete và kiểm tra ownership.
+- `media_type` là snapshot phân loại `image`, `video`, `audio` hoặc `file`; đây không phải foreign key hay bảng con theo từng loại media.
+- `content_type`, `original_name` và `size_bytes` giữ metadata Upload Server trả về để frontend không phải suy luận lại từ URL sau khi reload.
+- `width`, `height`, `duration_ms` và `thumbnail_url` là metadata tùy chọn cho collage, video và audio. Dữ liệu cũ có thể để `NULL` và được suy luận tạm từ URL/content type.
+- File vật lý và trạng thái pending/committed không được nhân đôi trong schema này; Upload Server là nguồn dữ liệu chính cho vòng đời asset.

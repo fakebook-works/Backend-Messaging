@@ -309,7 +309,16 @@ internal sealed class MessageAttachmentConfiguration
                 "ordinal >= 0 AND ordinal < 10");
             table.HasCheckConstraint(
                 "ck_message_attachments_https_url",
-                "url LIKE 'https://%'");
+                "url LIKE '/media/files/%' OR url LIKE 'https://%'");
+            table.HasCheckConstraint(
+                "ck_message_attachments_media_type",
+                "media_type IS NULL OR media_type IN ('image', 'video', 'audio', 'file')");
+            table.HasCheckConstraint(
+                "ck_message_attachments_metadata_nonnegative",
+                "(size_bytes IS NULL OR size_bytes >= 0) AND " +
+                "(width IS NULL OR width >= 0) AND " +
+                "(height IS NULL OR height >= 0) AND " +
+                "(duration_ms IS NULL OR duration_ms >= 0)");
         });
 
         builder.HasKey(attachment => new
@@ -329,6 +338,38 @@ internal sealed class MessageAttachmentConfiguration
             .HasColumnName("url")
             .HasMaxLength(2048)
             .IsRequired();
+
+        builder.Property(attachment => attachment.AssetId)
+            .HasColumnName("asset_id")
+            .HasMaxLength(128);
+
+        builder.Property(attachment => attachment.MediaType)
+            .HasColumnName("media_type")
+            .HasMaxLength(16);
+
+        builder.Property(attachment => attachment.ContentType)
+            .HasColumnName("content_type")
+            .HasMaxLength(128);
+
+        builder.Property(attachment => attachment.OriginalName)
+            .HasColumnName("original_name")
+            .HasMaxLength(255);
+
+        builder.Property(attachment => attachment.SizeBytes)
+            .HasColumnName("size_bytes");
+
+        builder.Property(attachment => attachment.Width)
+            .HasColumnName("width");
+
+        builder.Property(attachment => attachment.Height)
+            .HasColumnName("height");
+
+        builder.Property(attachment => attachment.DurationMs)
+            .HasColumnName("duration_ms");
+
+        builder.Property(attachment => attachment.ThumbnailUrl)
+            .HasColumnName("thumbnail_url")
+            .HasMaxLength(2048);
 
         builder.HasOne(attachment => attachment.Message)
             .WithMany(message => message.Attachments)

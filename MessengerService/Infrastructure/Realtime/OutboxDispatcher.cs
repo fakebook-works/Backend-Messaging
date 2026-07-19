@@ -15,6 +15,7 @@ public sealed class OutboxDispatcher(
     ITopicEventSender eventSender,
     IUploadMediaClient uploadMediaClient,
     IOptions<MessagingOptions> options,
+    OutboxWakeSignal wakeSignal,
     ILogger<OutboxDispatcher> logger) : BackgroundService
 {
     private const int BatchSize = 50;
@@ -47,8 +48,12 @@ public sealed class OutboxDispatcher(
 
             if (dispatched == 0)
             {
-                await Task.Delay(idlePollMilliseconds, stoppingToken);
-                idlePollMilliseconds = Math.Min(maxIdlePollMilliseconds, idlePollMilliseconds * 2);
+                var wasWoken = await wakeSignal.WaitAsync(
+                    TimeSpan.FromMilliseconds(idlePollMilliseconds),
+                    stoppingToken);
+                idlePollMilliseconds = wasWoken
+                    ? pollMilliseconds
+                    : Math.Min(maxIdlePollMilliseconds, idlePollMilliseconds * 2);
             }
             else
             {

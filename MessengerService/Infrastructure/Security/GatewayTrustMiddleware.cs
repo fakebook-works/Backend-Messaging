@@ -91,16 +91,43 @@ public sealed class GatewayTrustMiddleware(
 
         if (!isActive)
         {
-            logger.LogWarning(
-                "Rejected trusted Messaging request because user {UserId} is not active.",
-                userId);
-            await SecurityProblemWriter.WriteAsync(
-                context,
-                StatusCodes.Status403Forbidden,
-                "The trusted user is not active in Messaging.",
-                "MESSAGING_USER_NOT_ACTIVE",
-                context.RequestAborted);
-            return;
+            ProvisionUserOutcome outcome;
+            try
+            {
+                // A valid Gateway request represents an authenticated Fakebook user.
+                // Repair projections missed by older provisioning flows, while the
+                // durable tombstone still prevents deleted users from being revived.
+                outcome = await users.ProvisionAsync(userId, context.RequestAborted);
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                logger.LogError(exception, "Could not repair the trusted user's Messaging projection.");
+                await SecurityProblemWriter.WriteAsync(
+                    context,
+                    StatusCodes.Status503ServiceUnavailable,
+                    "Messaging user state is unavailable.",
+                    "USER_STATE_UNAVAILABLE",
+                    context.RequestAborted);
+                return;
+            }
+
+            if (outcome == ProvisionUserOutcome.DeletedTombstone)
+            {
+                logger.LogWarning(
+                    "Rejected trusted Messaging request because user {UserId} has a deletion tombstone.",
+                    userId);
+                await SecurityProblemWriter.WriteAsync(
+                    context,
+                    StatusCodes.Status403Forbidden,
+                    "The trusted user is not active in Messaging.",
+                    "MESSAGING_USER_NOT_ACTIVE",
+                    context.RequestAborted);
+                return;
+            }
         }
 
         context.Items[TrustedUserContextAccessor.HttpContextItemKey] =

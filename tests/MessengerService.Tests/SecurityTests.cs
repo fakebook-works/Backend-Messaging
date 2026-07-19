@@ -1,6 +1,7 @@
 using System.Text.Json;
 using MessengerService.Application.Abstractions;
 using MessengerService.Configuration;
+using MessengerService.Contracts.Internal;
 using MessengerService.Infrastructure.Security;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -116,6 +117,7 @@ public sealed class GatewayTrustMiddlewareTests
 
         Assert.True(nextWasCalled);
         Assert.Equal([9007199254740991L], users.ActiveChecks);
+        Assert.Empty(users.ProvisionedUserIds);
         var accessor = new TrustedUserContextAccessor(
             new HttpContextAccessor { HttpContext = context });
         Assert.Equal(9007199254740991L, accessor.RequireUserId());
@@ -145,9 +147,14 @@ public sealed class GatewayTrustMiddlewareTests
     }
 
     [Fact]
-    public async Task InactiveUser_IsRejected()
+    public async Task MissingProjection_IsRepairedForAuthenticatedGatewayUser()
     {
-        var middleware = CreateGatewayMiddleware(_ => Task.CompletedTask);
+        var nextWasCalled = false;
+        var middleware = CreateGatewayMiddleware(_ =>
+        {
+            nextWasCalled = true;
+            return Task.CompletedTask;
+        });
         var users = new FakeProvisioningService { IsActive = false };
         var context = NewContext("/graphql");
         context.Request.Headers[MessagingHeaders.GatewaySecret] = StrongSecret;
@@ -155,6 +162,26 @@ public sealed class GatewayTrustMiddlewareTests
 
         await middleware.InvokeAsync(context, users);
 
+        Assert.True(nextWasCalled);
+        Assert.Equal([42L], users.ProvisionedUserIds);
+    }
+
+    [Fact]
+    public async Task DeletedProjection_IsNotRevived()
+    {
+        var middleware = CreateGatewayMiddleware(_ => Task.CompletedTask);
+        var users = new FakeProvisioningService
+        {
+            IsActive = false,
+            ProvisionOutcome = ProvisionUserOutcome.DeletedTombstone
+        };
+        var context = NewContext("/graphql");
+        context.Request.Headers[MessagingHeaders.GatewaySecret] = StrongSecret;
+        context.Request.Headers[MessagingHeaders.UserId] = "42";
+
+        await middleware.InvokeAsync(context, users);
+
+        Assert.Equal([42L], users.ProvisionedUserIds);
         Assert.Equal(StatusCodes.Status403Forbidden, context.Response.StatusCode);
         Assert.Equal("MESSAGING_USER_NOT_ACTIVE", await ReadProblemCodeAsync(context));
     }

@@ -18,12 +18,30 @@ public sealed record RemoveConversationMemberInput(Guid ConversationId, long Use
 
 public sealed record SetConversationMemberRoleInput(Guid ConversationId, long UserId, ParticipantRole Role);
 
+/// <summary>
+/// Optional upload metadata carried with a message attachment. Url remains
+/// optional here so a caller can use AttachmentUrls as a compatibility
+/// fallback while gradually adopting this contract.
+/// </summary>
+public sealed record SendMessageAttachmentInput(
+    string? Url,
+    string? AssetId,
+    string? MediaType,
+    string? ContentType,
+    string? OriginalName,
+    long? SizeBytes,
+    int? Width,
+    int? Height,
+    long? DurationMs,
+    string? ThumbnailUrl);
+
 public sealed record SendMessageInput(
     Guid ConversationId,
     Guid ClientMessageId,
     string? Text,
     IReadOnlyList<string>? AttachmentUrls,
-    Guid? ReplyToMessageId);
+    Guid? ReplyToMessageId,
+    IReadOnlyList<SendMessageAttachmentInput>? Attachments = null);
 
 public sealed record EditMessageInput(Guid MessageId, string Text);
 

@@ -44,7 +44,18 @@ public sealed record MessageView(
     public bool Deleted => DeletedAt is not null;
 }
 
-public sealed record MessageAttachmentView(int Ordinal, string Url);
+public sealed record MessageAttachmentView(
+    int Ordinal,
+    string Url,
+    string? AssetId = null,
+    string? MediaType = null,
+    string? ContentType = null,
+    string? OriginalName = null,
+    long? SizeBytes = null,
+    int? Width = null,
+    int? Height = null,
+    long? DurationMs = null,
+    string? ThumbnailUrl = null);
 
 public sealed record MessageReactionView(long UserId, string Emoji, DateTimeOffset UpdatedAt);
 

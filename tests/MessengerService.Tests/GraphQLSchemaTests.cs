@@ -33,6 +33,8 @@ public sealed class GraphQLSchemaTests
         var schema = executor.Schema.ToString();
 
         Assert.Contains("type Query", schema, StringComparison.Ordinal);
+        Assert.Contains("message(id: UUID!): MessageView!", schema, StringComparison.Ordinal);
+        Assert.Contains("myDirectConversations(first: Int! = 40, after: String): ConversationPage!", schema, StringComparison.Ordinal);
         Assert.Contains("type Mutation", schema, StringComparison.Ordinal);
         Assert.Contains("type Subscription", schema, StringComparison.Ordinal);
         Assert.Contains("conversationEvents(conversationId: UUID!): RealtimeEvent!", schema, StringComparison.Ordinal);
@@ -41,5 +43,11 @@ public sealed class GraphQLSchemaTests
         Assert.Contains("type User @key(fields: \"id\")", schema, StringComparison.Ordinal);
         Assert.Contains("user: User", schema, StringComparison.Ordinal);
         Assert.Contains("sender: User", schema, StringComparison.Ordinal);
+        Assert.Contains("input SendMessageAttachmentInput", schema, StringComparison.Ordinal);
+        Assert.Contains("attachments: [SendMessageAttachmentInput!]", schema, StringComparison.Ordinal);
+        Assert.Contains("mediaType: String", schema, StringComparison.Ordinal);
+        Assert.Contains("originalName: String", schema, StringComparison.Ordinal);
+        Assert.Contains("sizeBytes: Long", schema, StringComparison.Ordinal);
+        Assert.Contains("thumbnailUrl: String", schema, StringComparison.Ordinal);
     }
 }

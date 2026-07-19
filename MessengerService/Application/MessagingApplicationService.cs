@@ -5,9 +5,11 @@ using MessengerService.Application.Abstractions;
 using MessengerService.Application.Models;
 using MessengerService.Application.Media;
 using MessengerService.Application.Realtime;
+using MessengerService.Contracts.Internal;
 using MessengerService.Domain.Entities;
 using MessengerService.Domain.Enums;
 using MessengerService.Infrastructure.Persistence;
+using MessengerService.Infrastructure.Realtime;
 using HotChocolate.Subscriptions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -17,7 +19,9 @@ namespace MessengerService.Application;
 public sealed class MessagingApplicationService(
     MessagingDbContext db,
     ISocialGraphPermissionClient socialGraph,
+    IMessagingUserProvisioningService userProvisioning,
     ITopicEventSender topicSender,
+    OutboxWakeSignal outboxWakeSignal,
     TimeProvider timeProvider,
     IOptions<MessagingRulesOptions> rulesOptions)
 {
@@ -28,14 +32,35 @@ public sealed class MessagingApplicationService(
         long userId,
         int first,
         string? after,
+        CancellationToken cancellationToken) =>
+        await GetMyConversationsAsync(userId, first, after, directOnly: false, cancellationToken);
+
+    public async Task<ConversationPage> GetMyDirectConversationsAsync(
+        long userId,
+        int first,
+        string? after,
+        CancellationToken cancellationToken) =>
+        await GetMyConversationsAsync(userId, first, after, directOnly: true, cancellationToken);
+
+    private async Task<ConversationPage> GetMyConversationsAsync(
+        long userId,
+        int first,
+        string? after,
+        bool directOnly,
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(userId, cancellationToken);
         first = RequirePageSize(first, 100);
         var offset = DecodeOffset(after);
 
-        var query = db.Conversations.AsNoTracking()
-            .Where(c => c.Participants.Any(p => p.UserId == userId && p.LeftAt == null))
+        var conversations = db.Conversations.AsNoTracking()
+            .Where(c => c.Participants.Any(p => p.UserId == userId && p.LeftAt == null));
+        if (directOnly)
+        {
+            conversations = conversations.Where(c => c.Type == ConversationType.Direct);
+        }
+
+        var query = conversations
             .OrderByDescending(c => c.UpdatedAt)
             .ThenByDescending(c => c.Id);
 
@@ -107,6 +132,23 @@ public sealed class MessagingApplicationService(
                 hasPrevious));
     }
 
+    public async Task<MessageView> GetMessageAsync(
+        long userId,
+        Guid messageId,
+        CancellationToken cancellationToken)
+    {
+        await RequireActiveUserAsync(userId, cancellationToken);
+        var message = await db.Messages.AsNoTracking()
+            .SingleOrDefaultAsync(value => value.Id == messageId, cancellationToken);
+        if (message is null)
+        {
+            Throw(MessagingErrorCodes.MessageNotFound, "The message does not exist.");
+        }
+
+        await RequireParticipantAsync(message.ConversationId, userId, cancellationToken);
+        return await MapMessageAsync(message, cancellationToken);
+    }
+
     public async Task<IReadOnlyList<UserPresenceView>> GetPresenceAsync(
         long userId,
         IReadOnlyCollection<long> userIds,
@@ -139,9 +181,9 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.InvalidInput, "A direct conversation requires another valid user.");
         }
 
-        await RequireActiveUsersAsync([command.TargetUserId], cancellationToken);
         await RequireSocialPermissionAsync(actorUserId, [command.TargetUserId],
             SocialGraphPermissionAction.CreateDirect, cancellationToken);
+        await EnsureActiveUserProjectionsAsync([command.TargetUserId], cancellationToken);
 
         var low = Math.Min(actorUserId, command.TargetUserId);
         var high = Math.Max(actorUserId, command.TargetUserId);
@@ -217,9 +259,9 @@ public sealed class MessagingApplicationService(
 
         var title = RequireText(command.Title, 120, "Group title");
         ValidateOptionalMediaUrl(command.AvatarUrl);
-        await RequireActiveUsersAsync(members, cancellationToken);
         await RequireSocialPermissionAsync(actorUserId, members,
             SocialGraphPermissionAction.AddGroupMembers, cancellationToken);
+        await EnsureActiveUserProjectionsAsync(members, cancellationToken);
 
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
@@ -311,9 +353,9 @@ public sealed class MessagingApplicationService(
         var authorizedToAdd = new HashSet<long>();
         if (toAdd.Length > 0)
         {
-            await RequireActiveUsersAsync(toAdd, cancellationToken);
             await RequireSocialPermissionAsync(actorUserId, toAdd,
                 SocialGraphPermissionAction.AddGroupMembers, cancellationToken);
+            await EnsureActiveUserProjectionsAsync(toAdd, cancellationToken);
             authorizedToAdd.UnionWith(toAdd);
         }
 
@@ -443,17 +485,18 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.InvalidInput, $"Message text cannot exceed {_rules.MaxMessageLength} characters.");
         }
 
-        if (command.AttachmentUrls.Count > _rules.MaxAttachmentsPerMessage)
+        var attachments = NormalizeAttachments(command);
+        if (attachments.Count > _rules.MaxAttachmentsPerMessage)
         {
             Throw(MessagingErrorCodes.InvalidInput, $"A message supports at most {_rules.MaxAttachmentsPerMessage} attachments.");
         }
 
-        foreach (var url in command.AttachmentUrls)
+        foreach (var attachment in attachments)
         {
-            ValidateMediaUrl(url);
+            ValidateAttachment(attachment);
         }
 
-        if (text is null && command.AttachmentUrls.Count == 0)
+        if (text is null && attachments.Count == 0)
         {
             Throw(MessagingErrorCodes.InvalidInput, "A message requires text or an attachment.");
         }
@@ -520,13 +563,23 @@ public sealed class MessagingApplicationService(
             ReplyToMessageId = command.ReplyToMessageId,
             CreatedAt = now
         };
-        for (var index = 0; index < command.AttachmentUrls.Count; index++)
+        for (var index = 0; index < attachments.Count; index++)
         {
+            var attachment = attachments[index];
             message.Attachments.Add(new MessageAttachment
             {
                 MessageId = message.Id,
                 Ordinal = index,
-                Url = command.AttachmentUrls[index]
+                Url = attachment.Url!,
+                AssetId = attachment.AssetId,
+                MediaType = attachment.MediaType,
+                ContentType = attachment.ContentType,
+                OriginalName = attachment.OriginalName,
+                SizeBytes = attachment.SizeBytes,
+                Width = attachment.Width,
+                Height = attachment.Height,
+                DurationMs = attachment.DurationMs,
+                ThumbnailUrl = attachment.ThumbnailUrl
             });
         }
 
@@ -537,7 +590,7 @@ public sealed class MessagingApplicationService(
         EnqueueEvent(ev, [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         var finalizeMediaEvent = MediaLifecycleOutbox.Create(
             MediaLifecycleEventKinds.Finalize,
-            command.AttachmentUrls,
+            attachments.Select(attachment => attachment.Url!),
             now,
             conversation.Id,
             message.Id,
@@ -571,7 +624,22 @@ public sealed class MessagingApplicationService(
             return await MapMessageAsync(winner, cancellationToken);
         }
 
-        return await MapMessageAsync(message, cancellationToken);
+        outboxWakeSignal.Pulse();
+        return new MessageView(
+            message.Id,
+            message.ConversationId,
+            message.SenderUserId,
+            message.Sequence,
+            message.ClientMessageId,
+            message.Text,
+            message.ReplyToMessageId,
+            message.CreatedAt,
+            null,
+            null,
+            attachments
+                .Select((attachment, ordinal) => ToAttachmentView(ordinal, attachment))
+                .ToArray(),
+            []);
     }
 
     public async Task<MessageView> EditMessageAsync(
@@ -744,18 +812,13 @@ public sealed class MessagingApplicationService(
         SetTypingCommand command,
         CancellationToken cancellationToken)
     {
-        db.ChangeTracker.Clear();
-        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        await LockConversationForActiveParticipantAsync(
-            actorUserId,
-            command.ConversationId,
-            cancellationToken);
+        await RequireActiveUserAsync(actorUserId, cancellationToken);
+        await RequireParticipantAsync(command.ConversationId, actorUserId, cancellationToken);
         var now = timeProvider.GetUtcNow();
         var expiresAt = command.IsTyping ? now.AddSeconds(_rules.TypingTtlSeconds) : now;
         var ev = NewEvent(RealtimeEventKinds.TypingChanged, now, command.ConversationId,
             userId: actorUserId, expiresAt: expiresAt);
         await topicSender.SendAsync(RealtimeTopics.Conversation(command.ConversationId), ev, cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
         return new TypingView(command.ConversationId, actorUserId, command.IsTyping, expiresAt);
     }
 
@@ -799,6 +862,11 @@ public sealed class MessagingApplicationService(
 
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        if (becameOnline)
+        {
+            outboxWakeSignal.Pulse();
+        }
+
         return new UserPresenceView(actorUserId, true, expiresAt, now);
     }
 
@@ -1049,9 +1117,17 @@ public sealed class MessagingApplicationService(
             .Select(target => target.UserId)
             .Distinct()
             .ToArrayAsync(cancellationToken);
-        if (visibleIds.Length != otherIds.Length)
+        var friendIdsWithoutConversation = otherIds.Except(visibleIds).ToArray();
+        if (friendIdsWithoutConversation.Length > 0)
         {
-            Throw(MessagingErrorCodes.Forbidden, "Presence is visible only to users sharing a conversation.");
+            // Friends may see one another's active status before the first direct
+            // conversation is created. SocialGraph remains the source of truth for
+            // friendship and block rules; non-friends still fail closed.
+            await RequireSocialPermissionAsync(
+                viewerId,
+                friendIdsWithoutConversation,
+                SocialGraphPermissionAction.CreateDirect,
+                cancellationToken);
         }
     }
 
@@ -1077,6 +1153,22 @@ public sealed class MessagingApplicationService(
         {
             Throw(MessagingErrorCodes.UserDeleted, "The messaging user is deleted.");
         }
+    }
+
+    private async Task EnsureActiveUserProjectionsAsync(
+        IReadOnlyCollection<long> userIds,
+        CancellationToken cancellationToken)
+    {
+        foreach (var userId in userIds.Distinct())
+        {
+            var outcome = await userProvisioning.ProvisionAsync(userId, cancellationToken);
+            if (outcome == ProvisionUserOutcome.DeletedTombstone)
+            {
+                Throw(MessagingErrorCodes.UserDeleted, $"Messaging user {userId} is deleted.");
+            }
+        }
+
+        await RequireActiveUsersAsync(userIds, cancellationToken);
     }
 
     private async Task RequireActiveUsersAsync(IReadOnlyCollection<long> userIds,
@@ -1203,7 +1295,7 @@ public sealed class MessagingApplicationService(
                 message.ClientMessageId, deleted ? null : message.Text, message.ReplyToMessageId,
                 message.CreatedAt, message.EditedAt, message.DeletedAt,
                 deleted ? [] : attachments.Where(a => a.MessageId == message.Id)
-                    .Select(a => new MessageAttachmentView(a.Ordinal, a.Url)).ToArray(),
+                    .Select(ToAttachmentView).ToArray(),
                 deleted ? [] : reactions.Where(r => r.MessageId == message.Id)
                     .Select(r => new MessageReactionView(r.UserId, r.Emoji, r.UpdatedAt)).ToArray());
         }).ToArray();
@@ -1249,6 +1341,178 @@ public sealed class MessagingApplicationService(
         {
             ValidateMediaUrl(value);
         }
+    }
+
+    private IReadOnlyList<MessageAttachmentCommand> NormalizeAttachments(SendMessageCommand command)
+    {
+        var urls = command.AttachmentUrls ?? [];
+        var supplied = command.Attachments ?? [];
+
+        if (supplied.Count == 0)
+        {
+            return urls
+                .Select(url => new MessageAttachmentCommand(url))
+                .ToArray();
+        }
+
+        if (urls.Count > 0 && urls.Count != supplied.Count)
+        {
+            Throw(MessagingErrorCodes.InvalidInput,
+                "AttachmentUrls and Attachments must contain the same number of items when both are supplied.");
+        }
+
+        var normalized = new MessageAttachmentCommand[supplied.Count];
+        for (var index = 0; index < supplied.Count; index++)
+        {
+            var suppliedAttachment = supplied[index];
+            var suppliedUrl = NormalizeOptional(suppliedAttachment.Url);
+            var fallbackUrl = urls.Count == 0 ? null : NormalizeOptional(urls[index]);
+
+            if (suppliedUrl is not null && fallbackUrl is not null &&
+                !string.Equals(suppliedUrl, fallbackUrl, StringComparison.Ordinal))
+            {
+                Throw(MessagingErrorCodes.InvalidInput,
+                    "Attachment URL values must match when both attachment contracts are supplied.");
+            }
+
+            normalized[index] = suppliedAttachment with { Url = suppliedUrl ?? fallbackUrl };
+        }
+
+        return normalized;
+    }
+
+    private void ValidateAttachment(MessageAttachmentCommand attachment)
+    {
+        if (string.IsNullOrWhiteSpace(attachment.Url))
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Every attachment requires a URL.");
+        }
+
+        ValidateMediaUrl(attachment.Url);
+
+        if (!string.IsNullOrWhiteSpace(attachment.AssetId))
+        {
+            var assetId = attachment.AssetId.Trim();
+            if (assetId.Length > 128 || assetId.Any(char.IsWhiteSpace))
+            {
+                Throw(MessagingErrorCodes.InvalidInput, "Attachment asset ID is invalid.");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(attachment.MediaType) &&
+            !IsSupportedMediaType(attachment.MediaType))
+        {
+            Throw(MessagingErrorCodes.InvalidInput,
+                "Attachment media type must be image, video, audio, or file.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(attachment.ContentType) &&
+            attachment.ContentType.Trim().Length > 128)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment content type is too long.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(attachment.OriginalName) &&
+            attachment.OriginalName.Trim().Length > 255)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment original name is too long.");
+        }
+
+        if (attachment.SizeBytes is < 0 || attachment.Width is < 0 || attachment.Height is < 0 ||
+            attachment.DurationMs is < 0)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment metadata cannot contain negative values.");
+        }
+
+        if (attachment.Width is > 100_000 || attachment.Height is > 100_000)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment dimensions are out of range.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(attachment.ThumbnailUrl))
+        {
+            ValidateMediaUrl(attachment.ThumbnailUrl);
+        }
+    }
+
+    private static MessageAttachmentView ToAttachmentView(MessageAttachment attachment) =>
+        new(
+            attachment.Ordinal,
+            attachment.Url,
+            attachment.AssetId,
+            attachment.MediaType ?? InferMediaType(attachment.Url, attachment.ContentType),
+            attachment.ContentType ?? InferContentType(attachment.Url),
+            attachment.OriginalName,
+            attachment.SizeBytes,
+            attachment.Width,
+            attachment.Height,
+            attachment.DurationMs,
+            attachment.ThumbnailUrl);
+
+    private static MessageAttachmentView ToAttachmentView(int ordinal, MessageAttachmentCommand attachment) =>
+        new(
+            ordinal,
+            attachment.Url!,
+            attachment.AssetId,
+            attachment.MediaType ?? InferMediaType(attachment.Url!, attachment.ContentType),
+            attachment.ContentType ?? InferContentType(attachment.Url!),
+            attachment.OriginalName,
+            attachment.SizeBytes,
+            attachment.Width,
+            attachment.Height,
+            attachment.DurationMs,
+            attachment.ThumbnailUrl);
+
+    private static bool IsSupportedMediaType(string value) =>
+        value.Trim().ToLowerInvariant() is "image" or "video" or "audio" or "file";
+
+    private static string? InferMediaType(string? url, string? contentType)
+    {
+        var normalizedContentType = contentType?.Split(';', 2)[0].Trim().ToLowerInvariant();
+        if (normalizedContentType is not null)
+        {
+            if (normalizedContentType.StartsWith("image/", StringComparison.Ordinal)) return "image";
+            if (normalizedContentType.StartsWith("video/", StringComparison.Ordinal)) return "video";
+            if (normalizedContentType.StartsWith("audio/", StringComparison.Ordinal)) return "audio";
+        }
+
+        var extension = GetUrlExtension(url);
+        return extension switch
+        {
+            ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".bmp" => "image",
+            ".mp4" or ".webm" or ".mov" or ".m4v" => ".webm" == extension ? "audio" : "video",
+            ".mp3" or ".m4a" or ".wav" or ".ogg" or ".oga" => "audio",
+            _ => "file"
+        };
+    }
+
+    private static string? InferContentType(string? url)
+    {
+        return GetUrlExtension(url) switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".mp4" => "video/mp4",
+            ".webm" => "audio/webm",
+            ".mov" => "video/quicktime",
+            ".mp3" => "audio/mpeg",
+            ".m4a" => "audio/mp4",
+            ".wav" => "audio/wav",
+            ".ogg" or ".oga" => "audio/ogg",
+            ".pdf" => "application/pdf",
+            _ => null
+        };
+    }
+
+    private static string? GetUrlExtension(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var path = Uri.TryCreate(value, UriKind.Absolute, out var absolute)
+            ? absolute.AbsolutePath
+            : value.Split('?', '#')[0];
+        return System.IO.Path.GetExtension(path).ToLowerInvariant();
     }
 
     private void ValidateMediaUrl(string value)
