@@ -58,20 +58,22 @@ reducing idle traffic to an external PostgreSQL server.
 ```text
 POST   /internal/users             { "userId": 123 }
 DELETE /internal/users/{userId}
+GET    /internal/users/{userId}/direct-contact-ids   -> { "userIds": [ ... ] }
 ```
 
 Create is idempotent for an active user. Delete is terminal and idempotent; deleting an
 unknown ID creates a tombstone so a delayed create event cannot reactivate it. Deletion
 atomically marks presence offline, leaves active conversations, promotes the oldest
 remaining group member when the final admin is removed, and wakes open SSE streams so
-they can terminate after reauthorization.
+they can terminate after reauthorization. The read endpoint returns the distinct, sorted
+IDs of active users who share a direct conversation with the requested active user.
 
-## Required companion-service work
+## Companion-service integration
 
-SocialGraph must expose a batch messaging-permission REST endpoint and a Fusion `User`
-lookup (`id`, `name`, `avatar`, `isVerified`). Gateway must compose this source schema as
-`Messaging`, advertise SSE support, forward trusted headers on the downstream SSE request,
-and bypass its JSON response-buffer middleware for streaming responses.
+SocialGraph exposes a batch messaging-permission REST endpoint and a Fusion `User`
+lookup (`id`, `name`, `avatar`, `isVerified`). Gateway composes this source schema as
+`Messaging`, advertises SSE support, forwards trusted headers on the downstream SSE request,
+and bypasses its JSON response-buffer middleware for streaming responses.
 
 The exact wire shapes and Gateway handoff are documented in
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
