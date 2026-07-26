@@ -16,6 +16,11 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddInternalRequestSigning(
+    builder.Configuration,
+    "InternalServices:MessengerSharedSecret",
+    MessagingHeaders.InternalServiceSecret);
+
 var connectionString = builder.Configuration.GetConnectionString("PostgreSQL");
 if (string.IsNullOrWhiteSpace(connectionString))
 {
@@ -77,10 +82,12 @@ builder.Services.AddSingleton<ISubscriptionAuthorizationChecker, SubscriptionAut
 builder.Services.AddSingleton<OutboxWakeSignal>();
 builder.Services
     .AddHttpClient<ISocialGraphPermissionClient, SocialGraphPermissionClient>(client =>
-        client.Timeout = Timeout.InfiniteTimeSpan);
+        client.Timeout = Timeout.InfiniteTimeSpan)
+    .AddHttpMessageHandler<InternalRequestSigningHandler>();
 builder.Services
     .AddHttpClient<IUploadMediaClient, UploadMediaClient>(client =>
-        client.Timeout = Timeout.InfiniteTimeSpan);
+        client.Timeout = Timeout.InfiniteTimeSpan)
+    .AddHttpMessageHandler<InternalRequestSigningHandler>();
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
@@ -127,6 +134,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseMiddleware<CorrelationIdMiddleware>();
+app.UseMiddleware<InternalRequestSignatureMiddleware>();
 app.UseMiddleware<InternalApiAuthenticationMiddleware>();
 app.UseMiddleware<GatewayTrustMiddleware>();
 
