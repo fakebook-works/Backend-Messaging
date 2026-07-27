@@ -37,7 +37,9 @@ public sealed class GraphQLSchemaTests
         Assert.Contains("myDirectConversations(first: Int! = 40, after: String): ConversationPage!", schema, StringComparison.Ordinal);
         Assert.Contains("type Mutation", schema, StringComparison.Ordinal);
         Assert.Contains("type Subscription", schema, StringComparison.Ordinal);
-        Assert.Contains("conversationEvents(conversationId: UUID!): RealtimeEvent!", schema, StringComparison.Ordinal);
+        // Takes a list so one connection can carry every chat a client is watching; see
+        // MessagingSubscription.SubscribeToConversationEventsAsync.
+        Assert.Contains("conversationEvents(conversationIds: [UUID!]!): RealtimeEvent!", schema, StringComparison.Ordinal);
         Assert.Contains("inboxEvents: RealtimeEvent!", schema, StringComparison.Ordinal);
         Assert.Contains("presenceEvents(userIds: [Long!]!): RealtimeEvent!", schema, StringComparison.Ordinal);
         Assert.Contains("type User @key(fields: \"id\")", schema, StringComparison.Ordinal);
