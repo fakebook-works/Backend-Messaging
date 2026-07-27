@@ -15,6 +15,7 @@ using Microsoft.Extensions.Options;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddFakebookServiceDefaults(builder.Configuration, "fakebook-messenger");
 
 builder.Services.AddInternalRequestSigning(
     builder.Configuration,
@@ -145,8 +146,9 @@ app.MapGraphQL("/graphql").WithOptions(options =>
 });
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "ok", service = "Messaging" }));
-app.MapGet("/health/ready", async (MessagingDbContext db, CancellationToken cancellationToken) =>
-    await db.Database.CanConnectAsync(cancellationToken)
+app.MapGet("/health/ready", async (MessagingDbContext db, IInternalNonceStore nonceStore, CancellationToken cancellationToken) =>
+    await db.Database.CanConnectAsync(cancellationToken) &&
+    await nonceStore.IsAvailableAsync(cancellationToken)
         ? Results.Ok(new { status = "ready", service = "Messaging" })
         : Results.StatusCode(StatusCodes.Status503ServiceUnavailable));
 
