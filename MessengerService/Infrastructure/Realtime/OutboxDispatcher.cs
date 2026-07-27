@@ -19,6 +19,29 @@ public sealed class OutboxDispatcher(
     ILogger<OutboxDispatcher> logger) : BackgroundService
 {
     private const int BatchSize = 50;
+
+    /// <summary>
+    /// Attempts after which an event stops being retried.
+    /// </summary>
+    /// <remarks>
+    /// There was no ceiling at all: the claim query only filtered on processed_at and
+    /// next_attempt_at, so an event that could never succeed — a payload that fails to
+    /// deserialize, for instance — was retried every sixty seconds forever, and the cleanup
+    /// pass only removes rows with processed_at set, so it was never purged either.
+    /// </remarks>
+    private const int MaxAttempts = 10;
+
+    /// <summary>
+    /// How long a claimed batch is hidden from other workers while it is being dispatched.
+    /// </summary>
+    /// <remarks>
+    /// Claiming used to be FOR UPDATE SKIP LOCKED inside the same transaction that then made
+    /// the HTTP calls, so row locks were held across up to fifty round trips to the upload
+    /// service. Claiming now commits immediately and leases the rows instead, so dispatch
+    /// happens with no transaction open and no locks held.
+    /// </remarks>
+    private static readonly TimeSpan ClaimLease = TimeSpan.FromMinutes(5);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private DateTimeOffset _nextCleanupAt = DateTimeOffset.MinValue;
 
@@ -68,19 +91,40 @@ public sealed class OutboxDispatcher(
         var dbContext = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
         var now = DateTimeOffset.UtcNow;
 
-        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
-        var events = await dbContext.OutboxEvents
-            .FromSqlInterpolated(
-                $"""
-                 SELECT *
-                 FROM messenger.outbox_events
-                 WHERE processed_at IS NULL
-                   AND (next_attempt_at IS NULL OR next_attempt_at <= {now})
-                 ORDER BY created_at
-                 FOR UPDATE SKIP LOCKED
-                 LIMIT {BatchSize}
-                 """)
-            .ToListAsync(cancellationToken);
+        // Claim in its own short transaction, then dispatch with nothing held. The lease on
+        // next_attempt_at is what keeps another worker off these rows once the lock is gone;
+        // if this process dies mid-batch the lease simply expires and they are picked up again.
+        List<MessengerService.Domain.Entities.OutboxEvent> events;
+        await using (var claim = await dbContext.Database.BeginTransactionAsync(cancellationToken))
+        {
+            events = await dbContext.OutboxEvents
+                .FromSqlInterpolated(
+                    $"""
+                     SELECT *
+                     FROM messenger.outbox_events
+                     WHERE processed_at IS NULL
+                       AND attempt_count < {MaxAttempts}
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= {now})
+                     ORDER BY created_at
+                     FOR UPDATE SKIP LOCKED
+                     LIMIT {BatchSize}
+                     """)
+                .ToListAsync(cancellationToken);
+            if (events.Count == 0)
+            {
+                await claim.CommitAsync(cancellationToken);
+                return 0;
+            }
+
+            var leaseUntil = now.Add(ClaimLease);
+            foreach (var claimed in events)
+            {
+                claimed.NextAttemptAt = leaseUntil;
+            }
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await claim.CommitAsync(cancellationToken);
+        }
 
         foreach (var outboxEvent in events)
         {
@@ -116,22 +160,40 @@ public sealed class OutboxDispatcher(
             }
             catch (Exception exception)
             {
-                outboxEvent.AttemptCount++;
+                // A payload that will not deserialize cannot succeed on any later attempt, so
+                // it is retired immediately rather than retried every minute until the ceiling.
+                var permanent = exception is JsonException;
+                outboxEvent.AttemptCount = permanent ? MaxAttempts : outboxEvent.AttemptCount + 1;
                 outboxEvent.LastError = Truncate(exception.Message, 4_000);
                 outboxEvent.NextAttemptAt = DateTimeOffset.UtcNow.AddSeconds(
                     Math.Min(60, Math.Pow(2, Math.Min(outboxEvent.AttemptCount, 6))));
 
-                logger.LogWarning(
-                    exception,
-                    "Could not publish Messaging outbox event {EventId} of kind {EventKind}; retry {AttemptCount} scheduled.",
-                    outboxEvent.Id,
-                    outboxEvent.Kind,
-                    outboxEvent.AttemptCount);
+                if (outboxEvent.AttemptCount >= MaxAttempts)
+                {
+                    // Left in the table with its error rather than deleted: it is the only
+                    // record of an event that was never delivered.
+                    logger.LogError(
+                        exception,
+                        "Messaging outbox event {EventId} of kind {EventKind} is dead-lettered after {AttemptCount} attempts and will not be retried.",
+                        outboxEvent.Id,
+                        outboxEvent.Kind,
+                        outboxEvent.AttemptCount);
+                }
+                else
+                {
+                    logger.LogWarning(
+                        exception,
+                        "Could not publish Messaging outbox event {EventId} of kind {EventKind}; retry {AttemptCount} scheduled.",
+                        outboxEvent.Id,
+                        outboxEvent.Kind,
+                        outboxEvent.AttemptCount);
+                }
             }
         }
 
+        // Results are written outside any transaction; the claim lease already reserved
+        // these rows, so nothing else can be working on them.
         await dbContext.SaveChangesAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
         return events.Count;
     }
 
