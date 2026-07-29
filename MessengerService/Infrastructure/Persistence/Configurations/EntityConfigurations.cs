@@ -1,3 +1,4 @@
+using MessengerService.Application;
 using MessengerService.Domain.Entities;
 using MessengerService.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
@@ -218,6 +219,19 @@ internal sealed class MessageConfiguration : IEntityTypeConfiguration<Message>
             table.HasCheckConstraint(
                 "ck_messages_delete_date",
                 "deleted_at IS NULL OR deleted_at >= created_at");
+            table.HasCheckConstraint(
+                "ck_messages_kind",
+                "kind IN ('User', 'System')");
+            table.HasCheckConstraint(
+                "ck_messages_system_event",
+                "system_event IS NULL OR system_event IN ('MemberAdded', 'MemberRemoved', 'MemberLeft', 'AdminGranted', 'AdminRevoked', 'GroupRenamed', 'GroupAvatarChanged')");
+            table.HasCheckConstraint(
+                "ck_messages_system_shape",
+                "(kind = 'User' AND system_event IS NULL AND system_subject_user_id IS NULL) OR " +
+                "(kind = 'System' AND system_event IS NOT NULL " +
+                "AND ((system_event IN ('GroupRenamed', 'GroupAvatarChanged') AND system_subject_user_id IS NULL) " +
+                "OR (system_event NOT IN ('GroupRenamed', 'GroupAvatarChanged') AND system_subject_user_id IS NOT NULL)) " +
+                "AND text IS NULL AND reply_to_message_id IS NULL AND edited_at IS NULL AND deleted_at IS NULL)");
         });
 
         builder.HasKey(message => message.Id)
@@ -240,9 +254,23 @@ internal sealed class MessageConfiguration : IEntityTypeConfiguration<Message>
             .HasColumnName("client_message_id")
             .ValueGeneratedNever();
 
+        builder.Property(message => message.Kind)
+            .HasColumnName("kind")
+            .HasConversion<string>()
+            .HasMaxLength(16)
+            .HasDefaultValue(MessageKind.User);
+
+        builder.Property(message => message.SystemEvent)
+            .HasColumnName("system_event")
+            .HasConversion<string>()
+            .HasMaxLength(32);
+
+        builder.Property(message => message.SystemSubjectUserId)
+            .HasColumnName("system_subject_user_id");
+
         builder.Property(message => message.Text)
             .HasColumnName("text")
-            .HasMaxLength(10_000);
+            .HasMaxLength(MessageTextHistoryCodec.MaxStoredLength);
 
         builder.Property(message => message.ReplyToMessageId)
             .HasColumnName("reply_to_message_id");
@@ -269,6 +297,12 @@ internal sealed class MessageConfiguration : IEntityTypeConfiguration<Message>
             .OnDelete(DeleteBehavior.Restrict)
             .HasConstraintName("fk_messages_users");
 
+        builder.HasOne(message => message.SystemSubject)
+            .WithMany()
+            .HasForeignKey(message => message.SystemSubjectUserId)
+            .OnDelete(DeleteBehavior.Restrict)
+            .HasConstraintName("fk_messages_system_subject_users");
+
         builder.HasOne(message => message.ReplyToMessage)
             .WithMany(message => message.Replies)
             .HasForeignKey(message => message.ReplyToMessageId)
@@ -294,6 +328,9 @@ internal sealed class MessageConfiguration : IEntityTypeConfiguration<Message>
 
         builder.HasIndex(message => message.ReplyToMessageId)
             .HasDatabaseName("ix_messages_reply_to_message_id");
+
+        builder.HasIndex(message => message.SystemSubjectUserId)
+            .HasDatabaseName("ix_messages_system_subject_user_id");
     }
 }
 

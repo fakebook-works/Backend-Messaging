@@ -3,6 +3,7 @@ using System;
 using MessengerService.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace MessengerService.Infrastructure.Persistence.Migrations
 {
     [DbContext(typeof(MessagingDbContext))]
-    partial class MessagingDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260728121452_AddStructuredSystemMessages")]
+    partial class AddStructuredSystemMessages
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -207,8 +210,8 @@ namespace MessengerService.Infrastructure.Persistence.Migrations
                         .HasColumnName("system_subject_user_id");
 
                     b.Property<string>("Text")
-                        .HasMaxLength(200000)
-                        .HasColumnType("character varying(200000)")
+                        .HasMaxLength(10000)
+                        .HasColumnType("character varying(10000)")
                         .HasColumnName("text");
 
                     b.HasKey("Id")

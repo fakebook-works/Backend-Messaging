@@ -1,4 +1,5 @@
 using MessengerService.Domain.Entities;
+using MessengerService.Application;
 using MessengerService.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
@@ -48,7 +49,7 @@ public sealed class PersistenceModelTests
     public void Messages_EnforceSequenceAndClientIdempotencyIndexes()
     {
         using var context = CreateContext();
-        var entity = context.Model.FindEntityType(typeof(Message))!;
+        var entity = context.GetService<IDesignTimeModel>().Model.FindEntityType(typeof(Message))!;
 
         var sequenceIndex = entity.GetIndexes().Single(candidate =>
             candidate.GetDatabaseName() == "ux_messages_conversation_sequence");
@@ -63,7 +64,15 @@ public sealed class PersistenceModelTests
         Assert.Equal(
             [nameof(Message.SenderUserId), nameof(Message.ClientMessageId)],
             clientIndex.Properties.Select(property => property.Name).ToArray());
-        Assert.Equal(10_000, entity.FindProperty(nameof(Message.Text))!.GetMaxLength());
+        Assert.Equal(
+            MessageTextHistoryCodec.MaxStoredLength,
+            entity.FindProperty(nameof(Message.Text))!.GetMaxLength());
+        Assert.Equal(16, entity.FindProperty(nameof(Message.Kind))!.GetMaxLength());
+        Assert.Equal(32, entity.FindProperty(nameof(Message.SystemEvent))!.GetMaxLength());
+        Assert.Contains(entity.GetCheckConstraints(), constraint => constraint.Name == "ck_messages_system_shape");
+        Assert.Contains(entity.GetForeignKeys(), foreignKey =>
+            foreignKey.GetConstraintName() == "fk_messages_system_subject_users" &&
+            foreignKey.Properties.Single().Name == nameof(Message.SystemSubjectUserId));
     }
 
     [Fact]

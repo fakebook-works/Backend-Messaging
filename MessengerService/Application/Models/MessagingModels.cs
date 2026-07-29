@@ -33,16 +33,22 @@ public sealed record MessageView(
     long SenderUserId,
     long Sequence,
     Guid ClientMessageId,
+    MessageKind Kind,
+    SystemMessageEvent? SystemEvent,
+    long? SystemSubjectUserId,
     string? Text,
     Guid? ReplyToMessageId,
     DateTimeOffset CreatedAt,
     DateTimeOffset? EditedAt,
+    IReadOnlyList<MessageEditRevisionView> EditHistory,
     DateTimeOffset? DeletedAt,
     IReadOnlyList<MessageAttachmentView> Attachments,
     IReadOnlyList<MessageReactionView> Reactions)
 {
     public bool Deleted => DeletedAt is not null;
 }
+
+public sealed record MessageEditRevisionView(string Text, DateTimeOffset VersionAt);
 
 public sealed record MessageAttachmentView(
     int Ordinal,
@@ -65,6 +71,6 @@ public sealed record ConversationReceiptView(
     long LastDeliveredSequence,
     long LastReadSequence);
 
-public sealed record UserPresenceView(long UserId, bool IsOnline, DateTimeOffset? ExpiresAt, DateTimeOffset UpdatedAt);
+public sealed record UserPresenceView(long UserId, bool IsOnline, DateTimeOffset? ExpiresAt, DateTimeOffset? UpdatedAt);
 
 public sealed record TypingView(Guid ConversationId, long UserId, bool IsTyping, DateTimeOffset ExpiresAt);

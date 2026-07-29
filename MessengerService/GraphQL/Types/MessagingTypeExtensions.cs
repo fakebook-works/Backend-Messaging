@@ -25,6 +25,13 @@ public sealed class MessageTypeExtension : ObjectTypeExtension<MessageView>
             .Field("sender")
             .Type<ObjectType<UserReference>>()
             .Resolve(context => new UserReference(context.Parent<MessageView>().SenderUserId));
+
+        descriptor
+            .Field("systemSubject")
+            .Type<ObjectType<UserReference>>()
+            .Resolve(context => context.Parent<MessageView>().SystemSubjectUserId is { } userId
+                ? new UserReference(userId)
+                : null);
     }
 }
 

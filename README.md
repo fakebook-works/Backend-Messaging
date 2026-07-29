@@ -53,6 +53,35 @@ When the outbox is empty, polling backs off from `Messaging:OutboxPollMillisecon
 `Messaging:OutboxMaxIdlePollMilliseconds` and resets after the next dispatched event,
 reducing idle traffic to an external PostgreSQL server.
 
+## Group administration
+
+Group title/avatar updates, member additions/removals, role changes, leaving and deletion
+are Gateway-only GraphQL mutations. The caller is always derived from the trusted Gateway
+context. Current database membership is checked for every operation; title/avatar/member
+changes require an active `Admin`, while a member can only leave as themselves. The final
+administrator cannot leave or be demoted until another administrator is assigned.
+
+`deleteGroupConversation` is restricted to a current administrator and only accepts a
+`Group` conversation. Deletion removes the conversation and its cascaded messages,
+participants, attachments and reactions in one transaction. Before the row is removed,
+the service queues `CONVERSATION_DELETED` to each active participant's private inbox.
+Managed message media with no surviving active reference is queued for deletion under
+the original sender's identity, so a group administrator is never treated as the owner
+of another member's upload and forwarded/shared media is not broken. Updating a managed
+group avatar queues `media.finalize.v1` under the acting administrator's identity.
+
+Group title/photo/member/role changes emit realtime invalidation events and append a
+durable structured system message in the same transaction. The existing message sender is
+the trusted actor; `kind`, `systemEvent` and the optional `systemSubjectUserId` tell clients
+how to render the centered activity line. Browser inputs cannot set those fields, and
+system messages cannot be edited, recalled, reacted to or replied to.
+
+User-message edits are atomic and retain a bounded history of the ten newest prior
+versions. The history is encoded in the existing message text column with a reserved,
+versioned server-only envelope. GraphQL decodes it into the current `text` and
+`editHistory`, and send/edit inputs cannot inject that reserved storage prefix. This keeps
+reply previews and clients independent from the persistence format.
+
 ## Internal user lifecycle
 
 ```text

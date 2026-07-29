@@ -1,3 +1,5 @@
+using MessengerService.Domain.Enums;
+
 namespace MessengerService.Domain.Entities;
 
 public sealed class Message
@@ -12,6 +14,12 @@ public sealed class Message
 
     public Guid ClientMessageId { get; set; }
 
+    public MessageKind Kind { get; set; } = MessageKind.User;
+
+    public SystemMessageEvent? SystemEvent { get; set; }
+
+    public long? SystemSubjectUserId { get; set; }
+
     public string? Text { get; set; }
 
     public Guid? ReplyToMessageId { get; set; }
@@ -25,6 +33,8 @@ public sealed class Message
     public Conversation Conversation { get; set; } = null!;
 
     public MessagingUser Sender { get; set; } = null!;
+
+    public MessagingUser? SystemSubject { get; set; }
 
     public Message? ReplyToMessage { get; set; }
 

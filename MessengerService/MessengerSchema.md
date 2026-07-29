@@ -177,7 +177,17 @@ check (sequence > 0),
 client_message_id   uuid                     not null
 constraint ck_messages_client_message_id
 check (client_message_id <> '00000000-0000-0000-0000-000000000000'::uuid),
-text                varchar(10000),
+kind                varchar(16) default 'User' not null
+constraint ck_messages_kind
+check ((kind)::text = ANY ((ARRAY ['User'::character varying, 'System'::character varying])::text[])),
+system_event        varchar(32)
+constraint ck_messages_system_event
+check ((system_event IS NULL) OR ((system_event)::text = ANY ((ARRAY ['MemberAdded'::character varying, 'MemberRemoved'::character varying, 'MemberLeft'::character varying, 'AdminGranted'::character varying, 'AdminRevoked'::character varying, 'GroupRenamed'::character varying, 'GroupAvatarChanged'::character varying])::text[]))),
+system_subject_user_id bigint
+constraint fk_messages_system_subject_users
+references users
+on delete restrict,
+text                varchar(200000),
 reply_to_message_id uuid
 constraint fk_messages_reply_to_message
 references messages
@@ -188,7 +198,13 @@ deleted_at          timestamp with time zone,
 constraint ck_messages_delete_date
 check ((deleted_at IS NULL) OR (deleted_at >= created_at)),
 constraint ck_messages_edit_date
-check ((edited_at IS NULL) OR (edited_at >= created_at))
+check ((edited_at IS NULL) OR (edited_at >= created_at)),
+constraint ck_messages_system_shape
+check (((kind)::text = 'User'::text AND system_event IS NULL AND system_subject_user_id IS NULL) OR
+       ((kind)::text = 'System'::text AND system_event IS NOT NULL AND
+        ((((system_event)::text = ANY ((ARRAY ['GroupRenamed'::character varying, 'GroupAvatarChanged'::character varying])::text[])) AND system_subject_user_id IS NULL) OR
+         (NOT ((system_event)::text = ANY ((ARRAY ['GroupRenamed'::character varying, 'GroupAvatarChanged'::character varying])::text[])) AND system_subject_user_id IS NOT NULL)) AND
+        text IS NULL AND reply_to_message_id IS NULL AND edited_at IS NULL AND deleted_at IS NULL))
 );
 
 alter table messages
@@ -196,6 +212,9 @@ owner to fakebook;
 
 create index ix_messages_reply_to_message_id
 on messages (reply_to_message_id);
+
+create index ix_messages_system_subject_user_id
+on messages (system_subject_user_id);
 
 create unique index ux_messages_conversation_sequence
 on messages (conversation_id asc, sequence desc);
@@ -286,6 +305,38 @@ owner to fakebook;
 create index ix_message_reactions_user_id
 on message_reactions (user_id);
 ```
+
+## Group lifecycle semantics
+
+- `conversation_participants.role` is the canonical source for `Admin` and `Member`; the
+  frontend must not infer administration from creation order or local state.
+- Active group membership is represented by `left_at IS NULL`. Member search can be done
+  over the complete `ConversationView.participants` result because the enforced group
+  limit is 250.
+- `deleteGroupConversation` requires an active administrator and a `Group` conversation.
+  The conversation row is physically removed; the existing cascade constraints remove
+  participants, messages, attachments and reactions in the same transaction.
+- Before deletion, `CONVERSATION_DELETED` is written to every active participant inbox.
+  Attachment cleanup excludes URLs still referenced by an active message elsewhere, then
+  uses the earliest source sender as `actor_user_id`, preserving Upload Server ownership
+  checks without breaking forwarded/shared media.
+- Group title/avatar/member/role changes still emit realtime invalidation hints, and now
+  also append durable `kind = 'System'` messages inside the same transaction. The existing
+  `sender_user_id` is the trusted actor; `system_event` selects the renderer and
+  `system_subject_user_id` identifies the affected member when the event has one.
+- `sendMessage` never accepts `kind`, `system_event` or a system subject. Only the
+  application service creates system rows. System messages cannot be edited, recalled,
+  reacted to or used as a reply target, preventing clients from forging administration
+  history.
+- Edited user messages keep at most ten previous revisions, oldest to newest, inside a
+  versioned server-only envelope in `messages.text`. Public send/edit input is rejected
+  when it starts with the reserved envelope prefix. GraphQL always decodes storage into
+  the current `text` plus `editHistory`; it never exposes the raw envelope. A malformed
+  historical envelope safely renders as legacy plain text, while deleted and system
+  messages expose no edit history.
+- Sending a user message and performing a durable group action advance the active actor's
+  delivered/read receipt to the new sequence in the same transaction. A user's own message
+  therefore never makes that conversation unread after a reload.
 
 ## Quy ước attachment
 

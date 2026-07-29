@@ -36,6 +36,7 @@ public sealed class GraphQLSchemaTests
         Assert.Contains("message(id: UUID!): MessageView!", schema, StringComparison.Ordinal);
         Assert.Contains("myDirectConversations(first: Int! = 40, after: String): ConversationPage!", schema, StringComparison.Ordinal);
         Assert.Contains("type Mutation", schema, StringComparison.Ordinal);
+        Assert.Contains("deleteGroupConversation(conversationId: UUID!): Boolean!", schema, StringComparison.Ordinal);
         Assert.Contains("type Subscription", schema, StringComparison.Ordinal);
         // Takes a list so one connection can carry every chat a client is watching; see
         // MessagingSubscription.SubscribeToConversationEventsAsync.
@@ -45,6 +46,17 @@ public sealed class GraphQLSchemaTests
         Assert.Contains("type User @key(fields: \"id\")", schema, StringComparison.Ordinal);
         Assert.Contains("user: User", schema, StringComparison.Ordinal);
         Assert.Contains("sender: User", schema, StringComparison.Ordinal);
+        Assert.Contains("kind: MessageKind!", schema, StringComparison.Ordinal);
+        Assert.Contains("systemEvent: SystemMessageEvent", schema, StringComparison.Ordinal);
+        Assert.Contains("systemSubject: User", schema, StringComparison.Ordinal);
+        Assert.Contains("editHistory: [MessageEditRevisionView!]!", schema, StringComparison.Ordinal);
+        Assert.Contains("type MessageEditRevisionView", schema, StringComparison.Ordinal);
+        var sendInput = schema[(schema.IndexOf("input SendMessageInput", StringComparison.Ordinal))..];
+        sendInput = sendInput[..sendInput.IndexOf('}')];
+        Assert.DoesNotContain("kind:", sendInput, StringComparison.Ordinal);
+        Assert.DoesNotContain("systemEvent:", sendInput, StringComparison.Ordinal);
+        Assert.DoesNotContain("systemSubject", sendInput, StringComparison.Ordinal);
+        Assert.DoesNotContain("editHistory", sendInput, StringComparison.Ordinal);
         Assert.Contains("input SendMessageAttachmentInput", schema, StringComparison.Ordinal);
         Assert.Contains("attachments: [SendMessageAttachmentInput!]", schema, StringComparison.Ordinal);
         Assert.Contains("mediaType: String", schema, StringComparison.Ordinal);

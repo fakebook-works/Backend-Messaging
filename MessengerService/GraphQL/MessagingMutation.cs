@@ -66,6 +66,13 @@ public sealed class MessagingMutation
         CancellationToken cancellationToken) =>
         messaging.LeaveConversationAsync(userContext.RequireUserId(), conversationId, cancellationToken);
 
+    public Task<bool> DeleteGroupConversation(
+        Guid conversationId,
+        [Service] MessagingApplicationService messaging,
+        [Service] ITrustedUserContextAccessor userContext,
+        CancellationToken cancellationToken) =>
+        messaging.DeleteGroupConversationAsync(userContext.RequireUserId(), conversationId, cancellationToken);
+
     public Task<MessageView> SendMessage(
         SendMessageInput input,
         [Service] MessagingApplicationService messaging,

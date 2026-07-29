@@ -1,12 +1,10 @@
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine AS runtime
 WORKDIR /app
-# Health probes need an HTTP client; the Debian runtime image ships none.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# Health probes need an HTTP client.
+RUN apk add --no-cache curl
 EXPOSE 1006
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-alpine AS build
 WORKDIR /src
 COPY ["MessengerService/MessengerService.csproj", "MessengerService/"]
 RUN dotnet restore "MessengerService/MessengerService.csproj"

@@ -14,6 +14,7 @@ public static class RealtimeEventKinds
 {
     public const string ConversationCreated = "CONVERSATION_CREATED";
     public const string ConversationUpdated = "CONVERSATION_UPDATED";
+    public const string ConversationDeleted = "CONVERSATION_DELETED";
     public const string MemberAdded = "MEMBER_ADDED";
     public const string MemberRemoved = "MEMBER_REMOVED";
     public const string MemberRoleChanged = "MEMBER_ROLE_CHANGED";

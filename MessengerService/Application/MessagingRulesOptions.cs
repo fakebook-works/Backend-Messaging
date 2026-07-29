@@ -12,7 +12,7 @@ public sealed class MessagingRulesOptions
 
     public int MaxAttachmentUrlLength { get; set; } = 2_048;
 
-    public int MaxPresenceUserIds { get; set; } = 100;
+    public int MaxPresenceUserIds { get; set; } = 250;
 
     public int EditWindowMinutes { get; set; } = 15;
 

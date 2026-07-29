@@ -13,6 +13,7 @@ using MessengerService.Infrastructure.Realtime;
 using HotChocolate.Subscriptions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using DomainMessageKind = MessengerService.Domain.Enums.MessageKind;
 
 namespace MessengerService.Application;
 
@@ -166,7 +167,7 @@ public sealed class MessagingApplicationService(
         return ids.Select(id => values.TryGetValue(id, out var value)
                 ? new UserPresenceView(id, value.IsOnline && value.ExpiresAt > now,
                     value.IsOnline && value.ExpiresAt > now ? value.ExpiresAt : null, value.UpdatedAt)
-                : new UserPresenceView(id, false, null, now))
+                : new UserPresenceView(id, false, null, null))
             .ToArray();
     }
 
@@ -310,25 +311,73 @@ public sealed class MessagingApplicationService(
             actorUserId,
             cancellationToken);
 
+        var titleChanged = false;
         if (command.HasTitle)
         {
-            conversation.Title = RequireText(command.Title, 120, "Group title");
+            var title = RequireText(command.Title, 120, "Group title");
+            titleChanged = !string.Equals(conversation.Title, title, StringComparison.Ordinal);
+            conversation.Title = title;
         }
 
+        var avatarChanged = false;
         if (command.HasAvatarUrl)
         {
             ValidateOptionalMediaUrl(command.AvatarUrl);
-            conversation.AvatarUrl = NormalizeOptional(command.AvatarUrl);
+            var avatarUrl = NormalizeOptional(command.AvatarUrl);
+            avatarChanged = !string.Equals(conversation.AvatarUrl, avatarUrl, StringComparison.Ordinal);
+            conversation.AvatarUrl = avatarUrl;
         }
 
         var now = timeProvider.GetUtcNow();
         conversation.UpdatedAt = now;
         var recipients = await ActiveParticipantIdsAsync(conversation.Id, cancellationToken);
+        if (titleChanged)
+        {
+            AppendSystemMessage(
+                conversation,
+                actorUserId,
+                SystemMessageEvent.GroupRenamed,
+                null,
+                now,
+                recipients);
+        }
+        if (avatarChanged)
+        {
+            AppendSystemMessage(
+                conversation,
+                actorUserId,
+                SystemMessageEvent.GroupAvatarChanged,
+                null,
+                now,
+                recipients);
+        }
+        if (titleChanged || avatarChanged)
+        {
+            var actorParticipant = await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
+            AdvanceReceipt(actorParticipant, conversation.CurrentSequence);
+        }
         EnqueueEvent(NewEvent(RealtimeEventKinds.ConversationUpdated, now, conversation.Id, userId: actorUserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
+        if (command.HasAvatarUrl && conversation.AvatarUrl is not null)
+        {
+            var finalizeAvatarEvent = MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Finalize,
+                [conversation.AvatarUrl],
+                now,
+                conversation.Id,
+                actorUserId: actorUserId);
+            if (finalizeAvatarEvent is not null)
+            {
+                db.OutboxEvents.Add(finalizeAvatarEvent);
+            }
+        }
         await db.SaveChangesAsync(cancellationToken);
         var result = await MapConversationAsync(conversation, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        if (command.HasAvatarUrl)
+        {
+            outboxWakeSignal.Pulse();
+        }
         return result;
     }
 
@@ -409,8 +458,19 @@ public sealed class MessagingApplicationService(
             }
         }
 
-        conversation.UpdatedAt = now;
         var recipients = active.Concat(toAdd).Distinct().ToArray();
+        var actorParticipant = await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
+        foreach (var userId in toAdd)
+        {
+            AppendSystemMessage(
+                conversation,
+                actorUserId,
+                SystemMessageEvent.MemberAdded,
+                userId,
+                now,
+                recipients);
+        }
+        AdvanceReceipt(actorParticipant, conversation.CurrentSequence);
         EnqueueEvent(NewEvent(RealtimeEventKinds.MemberAdded, now, conversation.Id, userId: actorUserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
@@ -430,6 +490,125 @@ public sealed class MessagingApplicationService(
         Guid conversationId,
         CancellationToken cancellationToken) =>
         RemoveOrLeaveAsync(actorUserId, conversationId, actorUserId, requireAdmin: false, cancellationToken);
+
+    public async Task<bool> DeleteGroupConversationAsync(
+        long actorUserId,
+        Guid conversationId,
+        CancellationToken cancellationToken)
+    {
+        await RequireActiveUserAsync(actorUserId, cancellationToken);
+        db.ChangeTracker.Clear();
+
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(cancellationToken)
+            : null;
+        var conversation = db.Database.IsRelational()
+            ? await LockGroupConversationForAdminAsync(conversationId, actorUserId, cancellationToken)
+            : await RequireGroupAdminAsync(conversationId, actorUserId, cancellationToken);
+
+        var recipients = await ActiveParticipantIdsAsync(conversation.Id, cancellationToken);
+        var conversationMedia = await db.MessageAttachments.AsNoTracking()
+            .Where(attachment => attachment.Message.ConversationId == conversation.Id)
+            .Select(attachment => new
+            {
+                attachment.Url,
+                attachment.ThumbnailUrl
+            })
+            .ToListAsync(cancellationToken);
+
+        var now = timeProvider.GetUtcNow();
+        var candidateUrls = conversationMedia
+            .SelectMany(media => new[] { media.Url, media.ThumbnailUrl })
+            .OfType<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var survivingRows = candidateUrls.Length == 0
+            ? []
+            : await db.MessageAttachments.AsNoTracking()
+                .Where(attachment =>
+                    attachment.Message.ConversationId != conversation.Id &&
+                    attachment.Message.DeletedAt == null &&
+                    (candidateUrls.Contains(attachment.Url) ||
+                     (attachment.ThumbnailUrl != null && candidateUrls.Contains(attachment.ThumbnailUrl))))
+                .Select(attachment => new { attachment.Url, attachment.ThumbnailUrl })
+                .ToListAsync(cancellationToken);
+        var survivingUrls = survivingRows
+            .SelectMany(media => new[] { media.Url, media.ThumbnailUrl })
+            .OfType<string>()
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var deletableUrls = candidateUrls
+            .Where(url => !survivingUrls.Contains(url))
+            .ToArray();
+        var ownershipRows = deletableUrls.Length == 0
+            ? []
+            : await db.MessageAttachments.AsNoTracking()
+                .Where(attachment =>
+                    deletableUrls.Contains(attachment.Url) ||
+                    (attachment.ThumbnailUrl != null && deletableUrls.Contains(attachment.ThumbnailUrl)))
+                .Select(attachment => new
+                {
+                    attachment.Url,
+                    attachment.ThumbnailUrl,
+                    attachment.Message.SenderUserId,
+                    attachment.Message.CreatedAt
+                })
+                .ToListAsync(cancellationToken);
+        var ownerByUrl = ownershipRows
+            .SelectMany(media => new (string? Url, long SenderUserId, DateTimeOffset CreatedAt)[]
+            {
+                (media.Url, media.SenderUserId, media.CreatedAt),
+                (media.ThumbnailUrl, media.SenderUserId, media.CreatedAt)
+            })
+            .Where(media => media.Url is not null && deletableUrls.Contains(media.Url))
+            .GroupBy(media => media.Url!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(media => media.CreatedAt).ThenBy(media => media.SenderUserId).First().SenderUserId,
+                StringComparer.OrdinalIgnoreCase);
+        foreach (var ownerGroup in deletableUrls
+                     .Where(ownerByUrl.ContainsKey)
+                     .GroupBy(url => ownerByUrl[url]))
+        {
+            var mediaEvent = MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Delete,
+                ownerGroup,
+                now,
+                conversation.Id,
+                actorUserId: ownerGroup.Key);
+            if (mediaEvent is not null)
+            {
+                db.OutboxEvents.Add(mediaEvent);
+            }
+        }
+
+        // Do not publish only on the conversation topic: once the row is gone the
+        // subscription authorizer must (correctly) deny that topic. Every active
+        // participant receives the terminal event through their private inbox.
+        EnqueueEvent(
+            NewEvent(RealtimeEventKinds.ConversationDeleted, now, conversation.Id, userId: actorUserId),
+            recipients.Select(RealtimeTopics.Inbox));
+        if (db.Database.IsRelational())
+        {
+            // Message replies use a restrictive self-reference so a single message can
+            // never be physically removed beneath its replies. Group deletion removes
+            // the whole aggregate, therefore clear those internal edges first inside
+            // the same transaction and let the conversation cascades do the rest.
+            await db.Messages
+                .Where(message => message.ConversationId == conversation.Id && message.ReplyToMessageId != null)
+                .ExecuteUpdateAsync(
+                    setters => setters.SetProperty(message => message.ReplyToMessageId, (Guid?)null),
+                    cancellationToken);
+        }
+        db.Conversations.Remove(conversation);
+        await db.SaveChangesAsync(cancellationToken);
+        if (transaction is not null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+        }
+
+        outboxWakeSignal.Pulse();
+        return true;
+    }
 
     public async Task<ConversationView> SetConversationMemberRoleAsync(
         long actorUserId,
@@ -456,10 +635,26 @@ public sealed class MessagingApplicationService(
             await EnsureNotLastAdminAsync(conversation.Id, participant.UserId, cancellationToken);
         }
 
+        if (participant.Role == command.Role)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return await MapConversationAsync(conversation, cancellationToken);
+        }
+
         participant.Role = command.Role;
         var now = timeProvider.GetUtcNow();
-        conversation.UpdatedAt = now;
         var recipients = await ActiveParticipantIdsAsync(conversation.Id, cancellationToken);
+        AppendSystemMessage(
+            conversation,
+            actorUserId,
+            command.Role == ParticipantRole.Admin
+                ? SystemMessageEvent.AdminGranted
+                : SystemMessageEvent.AdminRevoked,
+            command.UserId,
+            now,
+            recipients);
+        var actorParticipant = await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
+        AdvanceReceipt(actorParticipant, conversation.CurrentSequence);
         EnqueueEvent(NewEvent(RealtimeEventKinds.MemberRoleChanged, now, conversation.Id, userId: command.UserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
@@ -483,6 +678,11 @@ public sealed class MessagingApplicationService(
         if (text is not null && text.Length > _rules.MaxMessageLength)
         {
             Throw(MessagingErrorCodes.InvalidInput, $"Message text cannot exceed {_rules.MaxMessageLength} characters.");
+        }
+
+        if (MessageTextHistoryCodec.IsReservedInput(text))
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Message text uses a reserved internal prefix.");
         }
 
         var attachments = NormalizeAttachments(command);
@@ -528,9 +728,11 @@ public sealed class MessagingApplicationService(
         }
 
         if (command.ReplyToMessageId is { } replyId && !await db.Messages.AsNoTracking()
-                .AnyAsync(m => m.Id == replyId && m.ConversationId == conversation.Id, cancellationToken))
+                .AnyAsync(m => m.Id == replyId && m.ConversationId == conversation.Id &&
+                               m.Kind == DomainMessageKind.User, cancellationToken))
         {
-            Throw(MessagingErrorCodes.InvalidInput, "The replied-to message does not belong to this conversation.");
+            Throw(MessagingErrorCodes.InvalidInput,
+                "The replied-to message does not belong to this conversation or cannot be replied to.");
         }
 
         db.ChangeTracker.Clear();
@@ -545,10 +747,14 @@ public sealed class MessagingApplicationService(
             }
             : [actorUserId];
         await LockActiveUsersAsync(usersToLock, cancellationToken);
-        conversation = await db.Conversations.FromSqlInterpolated(
-                $"SELECT * FROM messenger.conversations WHERE id = {command.ConversationId} FOR UPDATE")
-            .SingleAsync(cancellationToken);
-        await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
+        conversation = db.Database.IsRelational()
+            ? await db.Conversations.FromSqlInterpolated(
+                    $"SELECT * FROM messenger.conversations WHERE id = {command.ConversationId} FOR UPDATE")
+                .SingleAsync(cancellationToken)
+            : await db.Conversations.SingleAsync(
+                value => value.Id == command.ConversationId,
+                cancellationToken);
+        var senderParticipant = await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
         conversation.CurrentSequence++;
         var now = timeProvider.GetUtcNow();
         conversation.UpdatedAt = now;
@@ -563,6 +769,7 @@ public sealed class MessagingApplicationService(
             ReplyToMessageId = command.ReplyToMessageId,
             CreatedAt = now
         };
+        AdvanceReceipt(senderParticipant, message.Sequence);
         for (var index = 0; index < attachments.Count; index++)
         {
             var attachment = attachments[index];
@@ -631,10 +838,14 @@ public sealed class MessagingApplicationService(
             message.SenderUserId,
             message.Sequence,
             message.ClientMessageId,
+            message.Kind,
+            message.SystemEvent,
+            message.SystemSubjectUserId,
             message.Text,
             message.ReplyToMessageId,
             message.CreatedAt,
             null,
+            [],
             null,
             attachments
                 .Select((attachment, ordinal) => ToAttachmentView(ordinal, attachment))
@@ -651,6 +862,10 @@ public sealed class MessagingApplicationService(
         var message = await RequireMessageAsync(command.MessageId, cancellationToken);
         var conversationId = message.ConversationId;
         var text = RequireText(command.Text, _rules.MaxMessageLength, "Message text");
+        if (MessageTextHistoryCodec.IsReservedInput(text))
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Message text uses a reserved internal prefix.");
+        }
 
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
@@ -659,6 +874,11 @@ public sealed class MessagingApplicationService(
         if (message.SenderUserId != actorUserId)
         {
             Throw(MessagingErrorCodes.Forbidden, "Only the message author can edit it.");
+        }
+
+        if (message.Kind == DomainMessageKind.System)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "System messages cannot be edited.");
         }
 
         if (message.DeletedAt is not null)
@@ -672,7 +892,18 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.EditWindowExpired, "The message edit window has expired.");
         }
 
-        message.Text = text;
+        var snapshot = MessageTextHistoryCodec.Decode(message.Text);
+        if (string.Equals(snapshot.Current, text, StringComparison.Ordinal))
+        {
+            var unchanged = await MapMessageAsync(message, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return unchanged;
+        }
+
+        message.Text = MessageTextHistoryCodec.EncodeEdit(
+            message.Text,
+            message.EditedAt ?? message.CreatedAt,
+            text);
         message.EditedAt = now;
         EnqueueEvent(NewEvent(RealtimeEventKinds.MessageEdited, now, message.ConversationId,
             message.Id, actorUserId, message.Sequence), RealtimeTopics.Conversation(message.ConversationId));
@@ -698,6 +929,11 @@ public sealed class MessagingApplicationService(
         if (message.SenderUserId != actorUserId)
         {
             Throw(MessagingErrorCodes.Forbidden, "Only the message author can delete it.");
+        }
+
+        if (message.Kind == DomainMessageKind.System)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "System messages cannot be deleted.");
         }
 
         if (message.DeletedAt is null)
@@ -760,6 +996,10 @@ public sealed class MessagingApplicationService(
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
         await LockConversationForActiveParticipantAsync(actorUserId, conversationId, cancellationToken);
         message = await RequireMessageAsync(command.MessageId, cancellationToken);
+        if (message.Kind == DomainMessageKind.System)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "System messages cannot be reacted to.");
+        }
         if (message.DeletedAt is not null)
         {
             Throw(MessagingErrorCodes.MessageDeleted, "A deleted message cannot be reacted to.");
@@ -902,15 +1142,19 @@ public sealed class MessagingApplicationService(
 
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        var participant = await db.ConversationParticipants
-            .FromSqlInterpolated(
-                $"""
-                 SELECT *
-                 FROM messenger.conversation_participants
-                 WHERE conversation_id = {conversation.Id} AND user_id = {actorUserId}
-                 FOR UPDATE
-                 """)
-            .SingleOrDefaultAsync(cancellationToken);
+        var participant = db.Database.IsRelational()
+            ? await db.ConversationParticipants
+                .FromSqlInterpolated(
+                    $"""
+                     SELECT *
+                     FROM messenger.conversation_participants
+                     WHERE conversation_id = {conversation.Id} AND user_id = {actorUserId}
+                     FOR UPDATE
+                     """)
+                .SingleOrDefaultAsync(cancellationToken)
+            : await db.ConversationParticipants.SingleOrDefaultAsync(
+                value => value.ConversationId == conversation.Id && value.UserId == actorUserId,
+                cancellationToken);
         if (participant?.LeftAt is not null || participant is null)
         {
             Throw(MessagingErrorCodes.NotParticipant, "The user is not an active conversation participant.");
@@ -964,7 +1208,19 @@ public sealed class MessagingApplicationService(
         var recipients = await ActiveParticipantIdsAsync(conversation.Id, cancellationToken);
         var now = timeProvider.GetUtcNow();
         participant.LeftAt = now;
-        conversation.UpdatedAt = now;
+        var remainingRecipients = recipients.Where(userId => userId != targetUserId).ToArray();
+        AppendSystemMessage(
+            conversation,
+            actorUserId,
+            requireAdmin ? SystemMessageEvent.MemberRemoved : SystemMessageEvent.MemberLeft,
+            targetUserId,
+            now,
+            remainingRecipients);
+        if (actorUserId != targetUserId)
+        {
+            var actorParticipant = await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
+            AdvanceReceipt(actorParticipant, conversation.CurrentSequence);
+        }
         EnqueueEvent(NewEvent(RealtimeEventKinds.MemberRemoved, now, conversation.Id, userId: targetUserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
@@ -1030,10 +1286,14 @@ public sealed class MessagingApplicationService(
         Guid conversationId,
         CancellationToken cancellationToken)
     {
-        var conversation = await db.Conversations
-            .FromSqlInterpolated(
-                $"SELECT * FROM messenger.conversations WHERE id = {conversationId} FOR UPDATE")
-            .SingleOrDefaultAsync(cancellationToken);
+        var conversation = db.Database.IsRelational()
+            ? await db.Conversations
+                .FromSqlInterpolated(
+                    $"SELECT * FROM messenger.conversations WHERE id = {conversationId} FOR UPDATE")
+                .SingleOrDefaultAsync(cancellationToken)
+            : await db.Conversations.SingleOrDefaultAsync(
+                value => value.Id == conversationId,
+                cancellationToken);
         if (conversation is null)
         {
             Throw(MessagingErrorCodes.ConversationNotFound, "The conversation does not exist.");
@@ -1195,11 +1455,15 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         var orderedIds = userIds.Distinct().Order().ToArray();
-        var rows = await db.Users
-            .FromSqlInterpolated(
-                $"SELECT * FROM messenger.users WHERE user_id = ANY ({orderedIds}) ORDER BY user_id FOR UPDATE")
-            .AsNoTracking()
-            .ToDictionaryAsync(user => user.UserId, cancellationToken);
+        var rows = db.Database.IsRelational()
+            ? await db.Users
+                .FromSqlInterpolated(
+                    $"SELECT * FROM messenger.users WHERE user_id = ANY ({orderedIds}) ORDER BY user_id FOR UPDATE")
+                .AsNoTracking()
+                .ToDictionaryAsync(user => user.UserId, cancellationToken)
+            : await db.Users.AsNoTracking()
+                .Where(user => orderedIds.Contains(user.UserId))
+                .ToDictionaryAsync(user => user.UserId, cancellationToken);
 
         foreach (var userId in orderedIds)
         {
@@ -1291,9 +1555,18 @@ public sealed class MessagingApplicationService(
         return messages.Select(message =>
         {
             var deleted = message.DeletedAt is not null;
+            var snapshot = deleted
+                ? new MessageTextSnapshot(string.Empty, [])
+                : MessageTextHistoryCodec.Decode(message.Text);
             return new MessageView(message.Id, message.ConversationId, message.SenderUserId, message.Sequence,
-                message.ClientMessageId, deleted ? null : message.Text, message.ReplyToMessageId,
-                message.CreatedAt, message.EditedAt, message.DeletedAt,
+                message.ClientMessageId, message.Kind, message.SystemEvent, message.SystemSubjectUserId,
+                deleted ? null : snapshot.Current, message.ReplyToMessageId,
+                message.CreatedAt, message.EditedAt,
+                deleted
+                    ? []
+                    : snapshot.History.Select(revision =>
+                        new MessageEditRevisionView(revision.Text, revision.VersionAt)).ToArray(),
+                message.DeletedAt,
                 deleted ? [] : attachments.Where(a => a.MessageId == message.Id)
                     .Select(ToAttachmentView).ToArray(),
                 deleted ? [] : reactions.Where(r => r.MessageId == message.Id)
@@ -1305,6 +1578,48 @@ public sealed class MessagingApplicationService(
         await db.ConversationParticipants.AsNoTracking()
             .Where(p => p.ConversationId == conversationId && p.LeftAt == null)
             .Select(p => p.UserId).ToArrayAsync(cancellationToken);
+
+    private Message AppendSystemMessage(
+        Conversation conversation,
+        long actorUserId,
+        SystemMessageEvent systemEvent,
+        long? subjectUserId,
+        DateTimeOffset now,
+        IReadOnlyCollection<long> recipients)
+    {
+        conversation.CurrentSequence++;
+        conversation.UpdatedAt = now;
+        var message = new Message
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = conversation.Id,
+            SenderUserId = actorUserId,
+            Sequence = conversation.CurrentSequence,
+            ClientMessageId = Guid.NewGuid(),
+            Kind = DomainMessageKind.System,
+            SystemEvent = systemEvent,
+            SystemSubjectUserId = subjectUserId,
+            CreatedAt = now
+        };
+        db.Messages.Add(message);
+        var realtimeEvent = NewEvent(
+            RealtimeEventKinds.MessageAdded,
+            now,
+            conversation.Id,
+            message.Id,
+            actorUserId,
+            message.Sequence);
+        EnqueueEvent(
+            realtimeEvent,
+            [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
+        return message;
+    }
+
+    private static void AdvanceReceipt(ConversationParticipant participant, long sequence)
+    {
+        participant.LastDeliveredSequence = Math.Max(participant.LastDeliveredSequence, sequence);
+        participant.LastReadSequence = Math.Max(participant.LastReadSequence, sequence);
+    }
 
     private void EnqueueEvent(RealtimeEvent realtimeEvent, params string[] topics) =>
         EnqueueEvent(realtimeEvent, (IEnumerable<string>)topics);
