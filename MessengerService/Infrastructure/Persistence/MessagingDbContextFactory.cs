@@ -7,7 +7,12 @@ public sealed class MessagingDbContextFactory : IDesignTimeDbContextFactory<Mess
 {
     public MessagingDbContext CreateDbContext(string[] args)
     {
-        var connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__PostgreSQL");
+        var connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__PostgreSQLMigration");
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__PostgreSQL");
+        }
+
         if (string.IsNullOrWhiteSpace(connectionString))
         {
             // `migrations add` only needs provider metadata and does not open this connection.
@@ -15,12 +20,9 @@ public sealed class MessagingDbContextFactory : IDesignTimeDbContextFactory<Mess
                 "Host=localhost;Port=5432;Database=fakebook;Username=fakebook;Password=design-time-only";
         }
 
-        var options = new DbContextOptionsBuilder<MessagingDbContext>()
-            .UseNpgsql(
-                connectionString,
-                postgres => postgres.MigrationsHistoryTable("__EFMigrationsHistory", MessagingDbContext.Schema))
-            .Options;
+        var optionsBuilder = new DbContextOptionsBuilder<MessagingDbContext>();
+        optionsBuilder.UseMessagingPostgreSql(connectionString);
 
-        return new MessagingDbContext(options);
+        return new MessagingDbContext(optionsBuilder.Options);
     }
 }

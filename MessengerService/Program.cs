@@ -30,11 +30,17 @@ if (string.IsNullOrWhiteSpace(connectionString))
 }
 
 builder.Services.AddDbContext<MessagingDbContext>(options =>
-    options.UseNpgsql(
-        connectionString,
-        postgres => postgres.MigrationsHistoryTable(
-            "__EFMigrationsHistory",
-            MessagingDbContext.Schema)));
+    options.UseMessagingPostgreSql(connectionString));
+builder.Services
+    .AddOptions<DatabaseMigrationOptions>()
+    .Bind(builder.Configuration.GetSection(DatabaseMigrationOptions.SectionName))
+    .Validate(
+        options => options.CommandTimeoutSeconds is >= 1 and <= 3_600,
+        "DatabaseMigrations:CommandTimeoutSeconds must be between 1 and 3600.")
+    .ValidateOnStart();
+// Hosted services start in registration order. Complete every EF migration before the
+// outbox and presence workers below are allowed to query their tables.
+builder.Services.AddHostedService<MessagingDatabaseMigrationHostedService>();
 
 builder.Services
     .AddOptions<GatewayOptions>()

@@ -1,6 +1,6 @@
 # Fakebook Messaging
 
-`Messaging` is the .NET 8 Hot Chocolate subgraph that owns conversations, participants,
+`Messaging` is the .NET 10 Hot Chocolate subgraph that owns conversations, participants,
 messages, reactions, receipts, typing and presence. The public API is GraphQL at
 `/graphql`; SocialGraph provisions and removes local user projections through internal
 REST endpoints.
@@ -23,10 +23,21 @@ REST endpoints.
 
 ```powershell
 dotnet restore .\MessengerService.sln
-dotnet ef database update --project .\MessengerService\MessengerService.csproj
 dotnet run --project .\MessengerService\MessengerService.csproj
 dotnet test .\MessengerService.sln
 ```
+
+Database migrations run automatically before the outbox and presence workers start. The
+service uses EF migrations, keeps `__EFMigrationsHistory` in the `messenger` schema, and takes
+a PostgreSQL session advisory lock on the same open connection for the whole migration. EF's
+own migration lock remains in place so startup also coordinates with `dotnet ef database
+update`. Any migration failure aborts startup.
+
+`DatabaseMigrations:Enabled` defaults to `true`. Set it to `false` only when a deployment job
+runs `dotnet ef database update --project .\MessengerService\MessengerService.csproj` before
+starting the service. `ConnectionStrings:PostgreSQLMigration` is optional and falls back to
+`ConnectionStrings:PostgreSQL`; shared deployments should use a DDL-capable migration role
+and retain a least-privileged runtime role for the latter connection.
 
 Export the Fusion v16 source schema:
 
