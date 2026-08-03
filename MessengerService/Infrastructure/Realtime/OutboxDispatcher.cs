@@ -135,11 +135,17 @@ public sealed class OutboxDispatcher(
                     var mediaPayload = MediaLifecycleOutbox.Deserialize(outboxEvent.PayloadJson);
                     if (outboxEvent.Kind == MediaLifecycleEventKinds.Finalize)
                     {
-                        await uploadMediaClient.FinalizeAsync(mediaPayload.Urls, cancellationToken);
+                        await uploadMediaClient.FinalizeAsync(
+                            mediaPayload.Urls,
+                            outboxEvent.ActorUserId,
+                            cancellationToken);
                     }
                     else
                     {
-                        await uploadMediaClient.DeleteAsync(mediaPayload.Urls, cancellationToken);
+                        await uploadMediaClient.DeleteAsync(
+                            mediaPayload.Urls,
+                            outboxEvent.ActorUserId,
+                            cancellationToken);
                     }
                 }
                 else

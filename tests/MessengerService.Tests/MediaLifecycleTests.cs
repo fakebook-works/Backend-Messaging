@@ -58,17 +58,17 @@ public sealed class UploadMediaClientTests
     [InlineData(false, "/internal/media/delete")]
     public async Task LifecycleRequest_SendsTrustedContract(bool finalize, string expectedPath)
     {
-        var handler = new StubHttpMessageHandler(HttpStatusCode.OK, "{}");
+        var handler = new StubHttpMessageHandler(HttpStatusCode.OK, "{\"finalized\":1}");
         var client = CreateClient(handler);
         var urls = new[] { "https://fakebook.example/media/files/a.jpg" };
 
         if (finalize)
         {
-            await client.FinalizeAsync(urls, CancellationToken.None);
+            await client.FinalizeAsync(urls, 42, CancellationToken.None);
         }
         else
         {
-            await client.DeleteAsync(urls, CancellationToken.None);
+            await client.DeleteAsync(urls, 42, CancellationToken.None);
         }
 
         Assert.Equal(expectedPath, handler.LastRequestUri!.AbsolutePath);
@@ -76,6 +76,7 @@ public sealed class UploadMediaClientTests
         Assert.Equal("media-correlation", Assert.Single(handler.LastHeaders[MessagingHeaders.CorrelationId]));
         using var body = JsonDocument.Parse(handler.LastBody!);
         Assert.Equal(urls, body.RootElement.GetProperty("urls").EnumerateArray().Select(value => value.GetString()));
+        Assert.Equal(42, body.RootElement.GetProperty("ownerUserId").GetInt64());
     }
 
     [Fact]
@@ -85,6 +86,7 @@ public sealed class UploadMediaClientTests
 
         await Assert.ThrowsAsync<HttpRequestException>(() => client.FinalizeAsync(
             ["/media/files/a.jpg"],
+            42,
             CancellationToken.None));
     }
 

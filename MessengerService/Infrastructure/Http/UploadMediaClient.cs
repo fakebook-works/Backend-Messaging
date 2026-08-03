@@ -16,16 +16,24 @@ public sealed class UploadMediaClient(
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    public Task FinalizeAsync(IReadOnlyCollection<string> urls, CancellationToken cancellationToken) =>
-        SendAsync("/internal/media/finalize", urls, cancellationToken);
+    public Task FinalizeAsync(
+        IReadOnlyCollection<string> urls,
+        long? ownerUserId,
+        CancellationToken cancellationToken) =>
+        SendAsync("/internal/media/finalize", urls, ownerUserId, cancellationToken, requireCompleteFinalize: true);
 
-    public Task DeleteAsync(IReadOnlyCollection<string> urls, CancellationToken cancellationToken) =>
-        SendAsync("/internal/media/delete", urls, cancellationToken);
+    public Task DeleteAsync(
+        IReadOnlyCollection<string> urls,
+        long? ownerUserId,
+        CancellationToken cancellationToken) =>
+        SendAsync("/internal/media/delete", urls, ownerUserId, cancellationToken);
 
     private async Task SendAsync(
         string path,
         IReadOnlyCollection<string> urls,
-        CancellationToken cancellationToken)
+        long? ownerUserId,
+        CancellationToken cancellationToken,
+        bool requireCompleteFinalize = false)
     {
         if (urls.Count == 0)
         {
@@ -45,7 +53,7 @@ public sealed class UploadMediaClient(
         timeout.CancelAfter(TimeSpan.FromSeconds(current.TimeoutSeconds));
         using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(baseUri, path))
         {
-            Content = JsonContent.Create(new MediaUrlsRequest(urls), options: JsonOptions)
+            Content = JsonContent.Create(new MediaUrlsRequest(urls, ownerUserId), options: JsonOptions)
         };
         request.Headers.TryAddWithoutValidation(MessagingHeaders.UploadServiceSecret, current.Upload.SharedSecret);
         request.Headers.TryAddWithoutValidation(
@@ -61,6 +69,22 @@ public sealed class UploadMediaClient(
                 HttpCompletionOption.ResponseHeadersRead,
                 timeout.Token);
             response.EnsureSuccessStatusCode();
+            if (requireCompleteFinalize)
+            {
+                using var document = JsonDocument.Parse(
+                    await response.Content.ReadAsStreamAsync(timeout.Token),
+                    new JsonDocumentOptions { MaxDepth = 4 });
+                var expected = urls
+                    .Where(url => !string.IsNullOrWhiteSpace(url))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Count();
+                if (!document.RootElement.TryGetProperty("finalized", out var finalizedElement) ||
+                    !finalizedElement.TryGetInt32(out var finalized) ||
+                    finalized != expected)
+                {
+                    throw new HttpRequestException("Upload media finalize acknowledged an incomplete batch.");
+                }
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -73,5 +97,5 @@ public sealed class UploadMediaClient(
         }
     }
 
-    private sealed record MediaUrlsRequest(IReadOnlyCollection<string> Urls);
+    private sealed record MediaUrlsRequest(IReadOnlyCollection<string> Urls, long? OwnerUserId);
 }
