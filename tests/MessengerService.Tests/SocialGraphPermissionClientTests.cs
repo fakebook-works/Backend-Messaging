@@ -126,6 +126,42 @@ public sealed class SocialGraphPermissionClientTests
     }
 
     [Fact]
+    public async Task CheckAsync_InspectBlockAcceptsNonFriendAndPreservesDirection()
+    {
+        var handler = new StubHttpMessageHandler(
+            HttpStatusCode.OK,
+            """
+            {
+              "results": [
+                {
+                  "targetUserId": 42,
+                  "allowed": true,
+                  "isFriend": false,
+                  "blockedEitherDirection": true,
+                  "actorBlockedTarget": false,
+                  "targetBlockedActor": true,
+                  "reason": "BLOCKED"
+                }
+              ]
+            }
+            """);
+        var client = CreateClient(handler);
+
+        var result = await client.CheckAsync(
+            7,
+            [42],
+            SocialGraphPermissionAction.InspectBlock,
+            CancellationToken.None);
+
+        var decision = Assert.Single(result.Decisions);
+        Assert.True(decision.Allowed);
+        Assert.False(decision.IsFriend);
+        Assert.True(decision.BlockedEitherDirection);
+        Assert.False(decision.ActorBlockedTarget);
+        Assert.True(decision.TargetBlockedActor);
+    }
+
+    [Fact]
     public async Task CheckAsync_UnsafeConfiguration_FailsBeforeSending()
     {
         var handler = new StubHttpMessageHandler(HttpStatusCode.OK, "{}");

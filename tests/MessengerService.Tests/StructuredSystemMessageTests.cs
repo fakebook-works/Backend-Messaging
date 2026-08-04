@@ -34,6 +34,35 @@ public sealed class StructuredSystemMessageTests
     }
 
     [Fact]
+    public async Task GroupReadsHideMessagesFromAUserBlockedInEitherDirection()
+    {
+        await using var db = NewDb();
+        var conversation = SeedGroup(db, 11, 22);
+        await db.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var sent = await NewService(db).SendMessageAsync(
+            22,
+            new SendMessageCommand(conversation.Id, Guid.NewGuid(), "hidden", [], null),
+            TestContext.Current.CancellationToken);
+        var viewerService = NewService(db, new BlockedUserPermissionClient(22));
+
+        var page = await viewerService.GetMessagesAsync(
+            11,
+            conversation.Id,
+            50,
+            null,
+            TestContext.Current.CancellationToken);
+        var view = await viewerService.GetConversationAsync(
+            11,
+            conversation.Id,
+            TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(page.Items, item => item.Id == sent.Id);
+        Assert.Null(view.LastMessage);
+        Assert.Equal(0, view.CurrentSequence);
+    }
+
+    [Fact]
     public async Task EditingMessage_ReturnsDecodedHistoryAndNeverLeaksStorageEnvelope()
     {
         await using var db = NewDb();
@@ -177,10 +206,12 @@ public sealed class StructuredSystemMessageTests
         return new MessagingDbContext(options);
     }
 
-    private static MessagingApplicationService NewService(MessagingDbContext db) =>
+    private static MessagingApplicationService NewService(
+        MessagingDbContext db,
+        ISocialGraphPermissionClient? permissions = null) =>
         new(
             db,
-            new AllowAllSocialGraphPermissionClient(),
+            permissions ?? new AllowAllSocialGraphPermissionClient(),
             new FakeProvisioningService(),
             null!,
             new OutboxWakeSignal(),
@@ -234,5 +265,23 @@ public sealed class StructuredSystemMessageTests
                     true,
                     false,
                     null)).ToArray()));
+    }
+
+    private sealed class BlockedUserPermissionClient(long blockedUserId) : ISocialGraphPermissionClient
+    {
+        public Task<SocialGraphPermissionCheckResult> CheckAsync(
+            long actorUserId,
+            IReadOnlyCollection<long> targetUserIds,
+            SocialGraphPermissionAction action,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new SocialGraphPermissionCheckResult(
+                targetUserIds.Select(userId => new SocialGraphPermissionDecision(
+                    userId,
+                    true,
+                    false,
+                    userId == blockedUserId,
+                    userId == blockedUserId ? "BLOCKED" : null,
+                    ActorBlockedTarget: false,
+                    TargetBlockedActor: userId == blockedUserId)).ToArray()));
     }
 }

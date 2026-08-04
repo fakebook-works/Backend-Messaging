@@ -27,6 +27,8 @@ public sealed class MessagingApplicationService(
     IOptions<MessagingRulesOptions> rulesOptions)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private const int PermissionBatchSize = 100;
+    private static readonly IReadOnlySet<long> EmptyUserIdSet = new HashSet<long>();
     private readonly MessagingRulesOptions _rules = rulesOptions.Value;
 
     public async Task<ConversationPage> GetMyConversationsAsync(
@@ -73,9 +75,10 @@ public sealed class MessagingApplicationService(
         }
 
         var items = new List<ConversationView>(rows.Count);
+        var directBlockStates = await GetDirectBlockStatesAsync(userId, rows, cancellationToken);
         foreach (var row in rows)
         {
-            items.Add(await MapConversationAsync(row, cancellationToken));
+            items.Add(await MapConversationAsync(row, cancellationToken, userId, directBlockStates));
         }
 
         return new ConversationPage(
@@ -95,7 +98,7 @@ public sealed class MessagingApplicationService(
         await RequireActiveUserAsync(userId, cancellationToken);
         await RequireParticipantAsync(conversationId, userId, cancellationToken);
         var conversation = await FindConversationAsync(conversationId, cancellationToken);
-        return await MapConversationAsync(conversation, cancellationToken);
+        return await MapConversationAsync(conversation, cancellationToken, userId);
     }
 
     public async Task<MessagePage> GetMessagesAsync(
@@ -107,11 +110,20 @@ public sealed class MessagingApplicationService(
     {
         await RequireActiveUserAsync(userId, cancellationToken);
         await RequireParticipantAsync(conversationId, userId, cancellationToken);
+        var conversation = await FindConversationAsync(conversationId, cancellationToken);
         last = RequirePageSize(last, 100);
         var beforeSequence = DecodeSequence(before) ?? long.MaxValue;
+        var blockedUserIds = conversation.Type == ConversationType.Group
+            ? await GetBlockedUserIdsAsync(
+                userId,
+                await ActiveParticipantIdsAsync(conversation.Id, cancellationToken),
+                cancellationToken)
+            : EmptyUserIdSet;
 
         var rows = await db.Messages.AsNoTracking()
-            .Where(m => m.ConversationId == conversationId && m.Sequence < beforeSequence)
+            .Where(m => m.ConversationId == conversationId &&
+                        m.Sequence < beforeSequence &&
+                        !blockedUserIds.Contains(m.SenderUserId))
             .OrderByDescending(m => m.Sequence)
             .Take(last + 1)
             .ToListAsync(cancellationToken);
@@ -123,7 +135,7 @@ public sealed class MessagingApplicationService(
         }
 
         rows.Reverse();
-        var items = await MapMessagesAsync(rows, cancellationToken);
+        var items = await MapMessagesAsync(rows, cancellationToken, blockedUserIds);
         return new MessagePage(
             items,
             new PageInfo(
@@ -147,7 +159,9 @@ public sealed class MessagingApplicationService(
         }
 
         await RequireParticipantAsync(message.ConversationId, userId, cancellationToken);
-        return await MapMessageAsync(message, cancellationToken);
+        await EnsureMessageVisibleAsync(userId, message, cancellationToken);
+        var hiddenReactionUserIds = await GetHiddenUserIdsForMessageAsync(userId, message, cancellationToken);
+        return await MapMessageAsync(message, cancellationToken, hiddenReactionUserIds);
     }
 
     public async Task<IReadOnlyList<UserPresenceView>> GetPresenceAsync(
@@ -158,13 +172,15 @@ public sealed class MessagingApplicationService(
         await RequireActiveUserAsync(userId, cancellationToken);
         var ids = NormalizeUserIds(userIds, allowEmpty: false);
         RequirePresenceListLimit(ids);
-        await RequirePresenceVisibilityAsync(userId, ids, cancellationToken);
+        var blockedUserIds = await RequirePresenceVisibilityAsync(userId, ids, cancellationToken);
         var now = timeProvider.GetUtcNow();
         var values = await db.UserPresences.AsNoTracking()
             .Where(p => ids.Contains(p.UserId))
             .ToDictionaryAsync(p => p.UserId, cancellationToken);
 
-        return ids.Select(id => values.TryGetValue(id, out var value)
+        return ids.Select(id => blockedUserIds.Contains(id)
+                ? new UserPresenceView(id, false, null, null)
+                : values.TryGetValue(id, out var value)
                 ? new UserPresenceView(id, value.IsOnline && value.ExpiresAt > now,
                     value.IsOnline && value.ExpiresAt > now ? value.ExpiresAt : null, value.UpdatedAt)
                 : new UserPresenceView(id, false, null, null))
@@ -211,7 +227,7 @@ public sealed class MessagingApplicationService(
             cancellationToken);
         if (existing is not null)
         {
-            var result = await MapConversationAsync(existing, cancellationToken);
+            var result = await MapConversationAsync(existing, cancellationToken, actorUserId);
             await transaction.CommitAsync(cancellationToken);
             return result;
         }
@@ -233,7 +249,7 @@ public sealed class MessagingApplicationService(
                 throw;
             }
 
-            return await MapConversationAsync(existing, cancellationToken);
+            return await MapConversationAsync(existing, cancellationToken, actorUserId);
         }
 
         EnqueueEvent(NewEvent(RealtimeEventKinds.ConversationCreated, now, conversation.Id, userId: actorUserId),
@@ -241,7 +257,7 @@ public sealed class MessagingApplicationService(
             RealtimeTopics.Inbox(command.TargetUserId));
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
-        return await MapConversationAsync(conversation, cancellationToken);
+        return await MapConversationAsync(conversation, cancellationToken, actorUserId);
     }
 
     public async Task<ConversationView> CreateGroupConversationAsync(
@@ -288,7 +304,7 @@ public sealed class MessagingApplicationService(
         var ev = NewEvent(RealtimeEventKinds.ConversationCreated, now, conversation.Id, userId: actorUserId);
         EnqueueEvent(ev, [RealtimeTopics.Conversation(conversation.Id), .. members.Append(actorUserId).Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
-        var result = await MapConversationAsync(conversation, cancellationToken);
+        var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
         await transaction.CommitAsync(cancellationToken);
         return result;
     }
@@ -372,7 +388,7 @@ public sealed class MessagingApplicationService(
             }
         }
         await db.SaveChangesAsync(cancellationToken);
-        var result = await MapConversationAsync(conversation, cancellationToken);
+        var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
         await transaction.CommitAsync(cancellationToken);
         if (command.HasAvatarUrl)
         {
@@ -423,7 +439,7 @@ public sealed class MessagingApplicationService(
         if (toAdd.Length == 0)
         {
             await transaction.CommitAsync(cancellationToken);
-            return await MapConversationAsync(conversation, cancellationToken);
+            return await MapConversationAsync(conversation, cancellationToken, actorUserId);
         }
 
         if (active.Count + toAdd.Length > _rules.MaxGroupParticipants)
@@ -474,7 +490,7 @@ public sealed class MessagingApplicationService(
         EnqueueEvent(NewEvent(RealtimeEventKinds.MemberAdded, now, conversation.Id, userId: actorUserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
-        var result = await MapConversationAsync(conversation, cancellationToken);
+        var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
         await transaction.CommitAsync(cancellationToken);
         return result;
     }
@@ -638,7 +654,7 @@ public sealed class MessagingApplicationService(
         if (participant.Role == command.Role)
         {
             await transaction.CommitAsync(cancellationToken);
-            return await MapConversationAsync(conversation, cancellationToken);
+            return await MapConversationAsync(conversation, cancellationToken, actorUserId);
         }
 
         participant.Role = command.Role;
@@ -658,7 +674,7 @@ public sealed class MessagingApplicationService(
         EnqueueEvent(NewEvent(RealtimeEventKinds.MemberRoleChanged, now, conversation.Id, userId: command.UserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
-        var result = await MapConversationAsync(conversation, cancellationToken);
+        var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
         await transaction.CommitAsync(cancellationToken);
         return result;
     }
@@ -727,12 +743,19 @@ public sealed class MessagingApplicationService(
                 SocialGraphPermissionAction.SendDirect, cancellationToken);
         }
 
-        if (command.ReplyToMessageId is { } replyId && !await db.Messages.AsNoTracking()
-                .AnyAsync(m => m.Id == replyId && m.ConversationId == conversation.Id &&
-                               m.Kind == DomainMessageKind.User, cancellationToken))
+        if (command.ReplyToMessageId is { } replyId)
         {
-            Throw(MessagingErrorCodes.InvalidInput,
-                "The replied-to message does not belong to this conversation or cannot be replied to.");
+            var repliedMessage = await db.Messages.AsNoTracking().SingleOrDefaultAsync(
+                m => m.Id == replyId && m.ConversationId == conversation.Id &&
+                     m.Kind == DomainMessageKind.User,
+                cancellationToken);
+            if (repliedMessage is null)
+            {
+                Throw(MessagingErrorCodes.InvalidInput,
+                    "The replied-to message does not belong to this conversation or cannot be replied to.");
+            }
+
+            await EnsureMessageVisibleAsync(actorUserId, repliedMessage, cancellationToken);
         }
 
         db.ChangeTracker.Clear();
@@ -867,10 +890,18 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.InvalidInput, "Message text uses a reserved internal prefix.");
         }
 
+        var conversation = await FindConversationAsync(conversationId, cancellationToken);
+        await RequireParticipantAsync(conversationId, actorUserId, cancellationToken);
+        await RequireDirectInteractionPermissionAsync(actorUserId, conversation, cancellationToken);
+
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        await LockConversationForActiveParticipantAsync(actorUserId, conversationId, cancellationToken);
+        await LockConversationForActiveParticipantAsync(
+            actorUserId,
+            conversationId,
+            cancellationToken);
         message = await RequireMessageAsync(command.MessageId, cancellationToken);
+        await EnsureMessageVisibleAsync(actorUserId, message, cancellationToken);
         if (message.SenderUserId != actorUserId)
         {
             Throw(MessagingErrorCodes.Forbidden, "Only the message author can edit it.");
@@ -921,11 +952,18 @@ public sealed class MessagingApplicationService(
         await RequireActiveUserAsync(actorUserId, cancellationToken);
         var message = await RequireMessageAsync(command.MessageId, cancellationToken);
         var conversationId = message.ConversationId;
+        var conversation = await FindConversationAsync(conversationId, cancellationToken);
+        await RequireParticipantAsync(conversationId, actorUserId, cancellationToken);
+        await RequireDirectInteractionPermissionAsync(actorUserId, conversation, cancellationToken);
 
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        await LockConversationForActiveParticipantAsync(actorUserId, conversationId, cancellationToken);
+        await LockConversationForActiveParticipantAsync(
+            actorUserId,
+            conversationId,
+            cancellationToken);
         message = await RequireMessageAsync(command.MessageId, cancellationToken);
+        await EnsureMessageVisibleAsync(actorUserId, message, cancellationToken);
         if (message.SenderUserId != actorUserId)
         {
             Throw(MessagingErrorCodes.Forbidden, "Only the message author can delete it.");
@@ -992,10 +1030,17 @@ public sealed class MessagingApplicationService(
         }
 
         var conversationId = message.ConversationId;
+        var conversation = await FindConversationAsync(conversationId, cancellationToken);
+        await RequireParticipantAsync(conversationId, actorUserId, cancellationToken);
+        await RequireDirectInteractionPermissionAsync(actorUserId, conversation, cancellationToken);
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        await LockConversationForActiveParticipantAsync(actorUserId, conversationId, cancellationToken);
+        await LockConversationForActiveParticipantAsync(
+            actorUserId,
+            conversationId,
+            cancellationToken);
         message = await RequireMessageAsync(command.MessageId, cancellationToken);
+        await EnsureMessageVisibleAsync(actorUserId, message, cancellationToken);
         if (message.Kind == DomainMessageKind.System)
         {
             Throw(MessagingErrorCodes.InvalidInput, "System messages cannot be reacted to.");
@@ -1053,7 +1098,22 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(actorUserId, cancellationToken);
-        await RequireParticipantAsync(command.ConversationId, actorUserId, cancellationToken);
+        var conversation = await FindConversationAsync(command.ConversationId, cancellationToken);
+        await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
+        if (conversation.Type == ConversationType.Direct)
+        {
+            var otherUserId = conversation.DirectUserLowId == actorUserId
+                ? conversation.DirectUserHighId
+                : conversation.DirectUserLowId;
+            if (otherUserId is { } targetUserId)
+            {
+                await RequireSocialPermissionAsync(
+                    actorUserId,
+                    [targetUserId],
+                    SocialGraphPermissionAction.SendDirect,
+                    cancellationToken);
+            }
+        }
         var now = timeProvider.GetUtcNow();
         var expiresAt = command.IsTyping ? now.AddSeconds(_rules.TypingTtlSeconds) : now;
         var ev = NewEvent(RealtimeEventKinds.TypingChanged, now, command.ConversationId,
@@ -1126,8 +1186,8 @@ public sealed class MessagingApplicationService(
         await RequireActiveUserAsync(userId, cancellationToken);
         var ids = NormalizeUserIds(userIds, allowEmpty: false);
         RequirePresenceListLimit(ids);
-        await RequirePresenceVisibilityAsync(userId, ids, cancellationToken);
-        return ids.ToHashSet();
+        var blockedUserIds = await RequirePresenceVisibilityAsync(userId, ids, cancellationToken);
+        return ids.Where(id => !blockedUserIds.Contains(id)).ToHashSet();
     }
 
     private async Task<ConversationReceiptView> MarkReceiptAsync(long actorUserId,
@@ -1224,7 +1284,7 @@ public sealed class MessagingApplicationService(
         EnqueueEvent(NewEvent(RealtimeEventKinds.MemberRemoved, now, conversation.Id, userId: targetUserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
         await db.SaveChangesAsync(cancellationToken);
-        var result = await MapConversationAsync(conversation, cancellationToken);
+        var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
         await transaction.CommitAsync(cancellationToken);
         return result;
     }
@@ -1358,14 +1418,43 @@ public sealed class MessagingApplicationService(
         }
     }
 
-    private async Task RequirePresenceVisibilityAsync(long viewerId, IReadOnlyCollection<long> targetIds,
+    private async Task RequireDirectInteractionPermissionAsync(
+        long actorUserId,
+        Conversation conversation,
+        CancellationToken cancellationToken)
+    {
+        if (conversation.Type != ConversationType.Direct)
+        {
+            return;
+        }
+
+        var targetUserId = conversation.DirectUserLowId == actorUserId
+            ? conversation.DirectUserHighId
+            : conversation.DirectUserLowId;
+        if (targetUserId is null || targetUserId <= 0 || targetUserId == actorUserId)
+        {
+            Throw(MessagingErrorCodes.DirectMessageForbidden,
+                "The direct conversation participants are invalid.");
+        }
+        var target = targetUserId.Value;
+
+        await RequireSocialPermissionAsync(
+            actorUserId,
+            [target],
+            SocialGraphPermissionAction.SendDirect,
+            cancellationToken);
+    }
+
+    private async Task<IReadOnlySet<long>> RequirePresenceVisibilityAsync(long viewerId, IReadOnlyCollection<long> targetIds,
         CancellationToken cancellationToken)
     {
         var otherIds = targetIds.Where(id => id != viewerId).Distinct().ToArray();
         if (otherIds.Length == 0)
         {
-            return;
+            return EmptyUserIdSet;
         }
+
+        var blockedIds = await GetBlockedUserIdsAsync(viewerId, otherIds, cancellationToken);
 
         var visibleIds = await db.ConversationParticipants.AsNoTracking()
             .Where(target => otherIds.Contains(target.UserId) &&
@@ -1377,7 +1466,10 @@ public sealed class MessagingApplicationService(
             .Select(target => target.UserId)
             .Distinct()
             .ToArrayAsync(cancellationToken);
-        var friendIdsWithoutConversation = otherIds.Except(visibleIds).ToArray();
+        var friendIdsWithoutConversation = otherIds
+            .Except(blockedIds)
+            .Except(visibleIds)
+            .ToArray();
         if (friendIdsWithoutConversation.Length > 0)
         {
             // Friends may see one another's active status before the first direct
@@ -1389,6 +1481,8 @@ public sealed class MessagingApplicationService(
                 SocialGraphPermissionAction.CreateDirect,
                 cancellationToken);
         }
+
+        return blockedIds;
     }
 
     private void RequirePresenceListLimit(IReadOnlyCollection<long> ids)
@@ -1516,8 +1610,165 @@ public sealed class MessagingApplicationService(
         return message;
     }
 
-    private async Task<ConversationView> MapConversationAsync(Conversation conversation,
+    private async Task<IReadOnlySet<long>> GetBlockedUserIdsAsync(
+        long viewerUserId,
+        IEnumerable<long> targetUserIds,
         CancellationToken cancellationToken)
+    {
+        var targets = targetUserIds
+            .Where(id => id > 0 && id != viewerUserId)
+            .Distinct()
+            .ToArray();
+        if (targets.Length == 0)
+        {
+            return EmptyUserIdSet;
+        }
+
+        var blocked = new HashSet<long>();
+        foreach (var chunk in targets.Chunk(PermissionBatchSize))
+        {
+            var result = await socialGraph.CheckAsync(
+                viewerUserId,
+                chunk,
+                SocialGraphPermissionAction.InspectBlock,
+                cancellationToken);
+            var decisions = result.Decisions.ToDictionary(decision => decision.TargetUserId);
+            if (chunk.Any(targetId => !decisions.ContainsKey(targetId)))
+            {
+                Throw(MessagingErrorCodes.SocialGraphUnavailable,
+                    "SocialGraph returned an incomplete block-state result.");
+            }
+
+            blocked.UnionWith(decisions.Values
+                .Where(decision => decision.BlockedEitherDirection)
+                .Select(decision => decision.TargetUserId));
+        }
+
+        return blocked;
+    }
+
+    private async Task<DirectBlockState?> GetDirectBlockStateAsync(
+        Conversation conversation,
+        long viewerUserId,
+        CancellationToken cancellationToken)
+    {
+        var otherUserId = conversation.DirectUserLowId == viewerUserId
+            ? conversation.DirectUserHighId
+            : conversation.DirectUserLowId;
+        if (otherUserId is not { } targetUserId || targetUserId <= 0 || targetUserId == viewerUserId)
+        {
+            return null;
+        }
+
+        try
+        {
+            var result = await socialGraph.CheckAsync(
+                viewerUserId,
+                [targetUserId],
+                SocialGraphPermissionAction.InspectBlock,
+                cancellationToken);
+            var decision = result.Decisions.SingleOrDefault(value => value.TargetUserId == targetUserId);
+            return decision is null
+                ? null
+                : new DirectBlockState(decision.ActorBlockedTarget, decision.TargetBlockedActor);
+        }
+        catch (MessagingApplicationException exception)
+            when (exception.Code == MessagingErrorCodes.SocialGraphUnavailable)
+        {
+            // A blocked profile may be hidden by SocialGraph during a brief
+            // restart. Keep the inbox readable; all write paths still fail
+            // closed through RequireSocialPermissionAsync.
+            return null;
+        }
+    }
+
+    private async Task<IReadOnlyDictionary<long, DirectBlockState>> GetDirectBlockStatesAsync(
+        long viewerUserId,
+        IReadOnlyCollection<Conversation> conversations,
+        CancellationToken cancellationToken)
+    {
+        var targetIds = conversations
+            .Where(conversation => conversation.Type == ConversationType.Direct)
+            .Select(conversation => conversation.DirectUserLowId == viewerUserId
+                ? conversation.DirectUserHighId
+                : conversation.DirectUserLowId)
+            .OfType<long>()
+            .Where(targetId => targetId > 0 && targetId != viewerUserId)
+            .Distinct()
+            .ToArray();
+        if (targetIds.Length == 0)
+        {
+            return new Dictionary<long, DirectBlockState>();
+        }
+
+        try
+        {
+            var states = new Dictionary<long, DirectBlockState>();
+            foreach (var chunk in targetIds.Chunk(PermissionBatchSize))
+            {
+                var result = await socialGraph.CheckAsync(
+                    viewerUserId,
+                    chunk,
+                    SocialGraphPermissionAction.InspectBlock,
+                    cancellationToken);
+                foreach (var decision in result.Decisions)
+                {
+                    states[decision.TargetUserId] = new DirectBlockState(
+                        decision.ActorBlockedTarget,
+                        decision.TargetBlockedActor);
+                }
+            }
+
+            return states;
+        }
+        catch (MessagingApplicationException exception)
+            when (exception.Code == MessagingErrorCodes.SocialGraphUnavailable)
+        {
+            return new Dictionary<long, DirectBlockState>();
+        }
+    }
+
+    private async Task EnsureMessageVisibleAsync(
+        long viewerUserId,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        var conversation = await db.Conversations.AsNoTracking()
+            .SingleOrDefaultAsync(value => value.Id == message.ConversationId, cancellationToken);
+        if (conversation?.Type != ConversationType.Group || message.SenderUserId == viewerUserId)
+        {
+            return;
+        }
+
+        var blocked = await GetBlockedUserIdsAsync(viewerUserId, [message.SenderUserId], cancellationToken);
+        if (blocked.Contains(message.SenderUserId))
+        {
+            Throw(MessagingErrorCodes.MessageNotFound, "The message is not available to this user.");
+        }
+    }
+
+    private async Task<IReadOnlySet<long>> GetHiddenUserIdsForMessageAsync(
+        long viewerUserId,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        var conversationType = await db.Conversations.AsNoTracking()
+            .Where(value => value.Id == message.ConversationId)
+            .Select(value => value.Type)
+            .SingleOrDefaultAsync(cancellationToken);
+        if (conversationType != ConversationType.Group)
+        {
+            return EmptyUserIdSet;
+        }
+
+        var participantIds = await ActiveParticipantIdsAsync(message.ConversationId, cancellationToken);
+        return await GetBlockedUserIdsAsync(viewerUserId, participantIds, cancellationToken);
+    }
+
+    private async Task<ConversationView> MapConversationAsync(Conversation conversation,
+        CancellationToken cancellationToken,
+        long? viewerUserId = null,
+        IReadOnlyDictionary<long, DirectBlockState>? directBlockStates = null)
     {
         var participants = await db.ConversationParticipants.AsNoTracking()
             .Where(p => p.ConversationId == conversation.Id && p.LeftAt == null)
@@ -1525,21 +1776,76 @@ public sealed class MessagingApplicationService(
             .Select(p => new ConversationParticipantView(p.UserId, p.Role, p.JoinedAt, p.LeftAt,
                 p.LastDeliveredSequence, p.LastReadSequence))
             .ToListAsync(cancellationToken);
-        var lastMessage = await db.Messages.AsNoTracking().Where(m => m.ConversationId == conversation.Id)
-            .OrderByDescending(m => m.Sequence).FirstOrDefaultAsync(cancellationToken);
+        var blockedUserIds = conversation.Type == ConversationType.Group && viewerUserId is { } viewer
+            ? await GetBlockedUserIdsAsync(viewer, participants.Select(p => p.UserId), cancellationToken)
+            : EmptyUserIdSet;
+        DirectBlockState? directBlockState = null;
+        if (conversation.Type == ConversationType.Direct && viewerUserId is { } directViewer)
+        {
+            var targetUserId = conversation.DirectUserLowId == directViewer
+                ? conversation.DirectUserHighId
+                : conversation.DirectUserLowId;
+            if (targetUserId is { } target && directBlockStates?.TryGetValue(target, out var knownState) == true)
+            {
+                directBlockState = knownState;
+            }
+            else
+            {
+                directBlockState = await GetDirectBlockStateAsync(conversation, directViewer, cancellationToken);
+            }
+        }
+        if (conversation.Type == ConversationType.Group && blockedUserIds.Count > 0)
+        {
+            // Keep the member rows so the group roster remains intact, but do
+            // not expose read/delivery cursors from a blocked member. Those
+            // cursors are presence-like data and would otherwise reveal that
+            // member's activity through group receipts.
+            participants = participants
+                .Select(participant => blockedUserIds.Contains(participant.UserId)
+                    ? participant with { LastDeliveredSequence = 0, LastReadSequence = 0 }
+                    : participant)
+                .ToList();
+        }
+        var directBlocked = directBlockState is { } state &&
+                            (state.ActorBlockedTarget || state.TargetBlockedActor);
+        if (directBlocked && viewerUserId is { } directViewerId)
+        {
+            participants = participants
+                .Select(participant => participant.UserId == directViewerId
+                    ? participant
+                    : participant with { LastDeliveredSequence = 0, LastReadSequence = 0 })
+                .ToList();
+        }
+        var visibleMessages = db.Messages.AsNoTracking()
+            .Where(m => m.ConversationId == conversation.Id && !blockedUserIds.Contains(m.SenderUserId));
+        var lastMessage = await visibleMessages
+            .OrderByDescending(m => m.Sequence)
+            .FirstOrDefaultAsync(cancellationToken);
+        var currentSequence = conversation.Type == ConversationType.Group
+            ? lastMessage?.Sequence ?? 0
+            : directBlocked && viewerUserId is { } blockedViewer
+                ? participants.FirstOrDefault(participant => participant.UserId == blockedViewer)?.LastReadSequence ?? 0
+                : conversation.CurrentSequence;
         return new ConversationView(conversation.Id, conversation.Type, conversation.Title, conversation.AvatarUrl,
-            conversation.CreatedAt, conversation.UpdatedAt, conversation.CurrentSequence, participants,
-            lastMessage is null ? null : await MapMessageAsync(lastMessage, cancellationToken));
+            conversation.CreatedAt, conversation.UpdatedAt, currentSequence, participants,
+            lastMessage is null ? null : await MapMessageAsync(lastMessage, cancellationToken, blockedUserIds),
+            directBlockState?.ActorBlockedTarget ?? false,
+            directBlockState?.TargetBlockedActor ?? false);
     }
 
-    private async Task<MessageView> MapMessageAsync(Message message, CancellationToken cancellationToken)
+    private async Task<MessageView> MapMessageAsync(
+        Message message,
+        CancellationToken cancellationToken,
+        IReadOnlySet<long>? hiddenUserIds = null)
     {
-        var list = await MapMessagesAsync([message], cancellationToken);
+        var list = await MapMessagesAsync([message], cancellationToken, hiddenUserIds);
         return list[0];
     }
 
-    private async Task<IReadOnlyList<MessageView>> MapMessagesAsync(IReadOnlyCollection<Message> messages,
-        CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<MessageView>> MapMessagesAsync(
+        IReadOnlyCollection<Message> messages,
+        CancellationToken cancellationToken,
+        IReadOnlySet<long>? hiddenUserIds = null)
     {
         if (messages.Count == 0)
         {
@@ -1569,10 +1875,13 @@ public sealed class MessagingApplicationService(
                 message.DeletedAt,
                 deleted ? [] : attachments.Where(a => a.MessageId == message.Id)
                     .Select(ToAttachmentView).ToArray(),
-                deleted ? [] : reactions.Where(r => r.MessageId == message.Id)
+                deleted ? [] : reactions.Where(r => r.MessageId == message.Id &&
+                    (hiddenUserIds is null || !hiddenUserIds.Contains(r.UserId)))
                     .Select(r => new MessageReactionView(r.UserId, r.Emoji, r.UpdatedAt)).ToArray());
         }).ToArray();
     }
+
+    private sealed record DirectBlockState(bool ActorBlockedTarget, bool TargetBlockedActor);
 
     private async Task<long[]> ActiveParticipantIdsAsync(Guid conversationId, CancellationToken cancellationToken) =>
         await db.ConversationParticipants.AsNoTracking()

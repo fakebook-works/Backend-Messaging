@@ -78,7 +78,7 @@ public sealed class MessagingSubscription
                 }
 
                 var decision = await authorizationChecker.AuthorizeConversationEventAsync(
-                    userId, conversationId, eventCancellationToken);
+                    userId, conversationId, message, eventCancellationToken);
 
                 // The checker answers Terminate when the viewer may not see this conversation,
                 // which was right when the stream carried one. Here it would tear down every

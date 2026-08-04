@@ -90,7 +90,7 @@ public sealed class SocialGraphPermissionClient(
                 SerializerOptions,
                 timeoutSource.Token);
 
-            return ValidateResponse(payload, targets);
+            return ValidateResponse(payload, targets, action);
         }
         catch (MessagingApplicationException)
         {
@@ -121,7 +121,8 @@ public sealed class SocialGraphPermissionClient(
 
     private static SocialGraphPermissionCheckResult ValidateResponse(
         PermissionCheckResponse? response,
-        IReadOnlyCollection<long> requestedTargets)
+        IReadOnlyCollection<long> requestedTargets,
+        SocialGraphPermissionAction action)
     {
         if (response?.Results is null || response.Results.Count != requestedTargets.Count)
         {
@@ -145,7 +146,12 @@ public sealed class SocialGraphPermissionClient(
                 result.Allowed is null ||
                 result.IsFriend is null ||
                 result.BlockedEitherDirection is null ||
-                (result.Allowed.Value &&
+                (action == SocialGraphPermissionAction.InspectBlock &&
+                 (result.ActorBlockedTarget is null || result.TargetBlockedActor is null)) ||
+                (result.ActorBlockedTarget is { } actorBlocked &&
+                 result.TargetBlockedActor is { } targetBlocked &&
+                 result.BlockedEitherDirection.Value != (actorBlocked || targetBlocked)) ||
+                (action != SocialGraphPermissionAction.InspectBlock && result.Allowed.Value &&
                  (!result.IsFriend.Value || result.BlockedEitherDirection.Value)))
             {
                 throw Unavailable();
@@ -156,7 +162,9 @@ public sealed class SocialGraphPermissionClient(
                 result.Allowed.Value,
                 result.IsFriend.Value,
                 result.BlockedEitherDirection.Value,
-                result.Reason));
+                result.Reason,
+                result.ActorBlockedTarget ?? false,
+                result.TargetBlockedActor ?? false));
         }
 
         return new SocialGraphPermissionCheckResult(decisions);
@@ -185,6 +193,7 @@ public sealed class SocialGraphPermissionClient(
         SocialGraphPermissionAction.CreateDirect => "CREATE_DIRECT",
         SocialGraphPermissionAction.SendDirect => "SEND_DIRECT",
         SocialGraphPermissionAction.AddGroupMembers => "ADD_GROUP_MEMBERS",
+        SocialGraphPermissionAction.InspectBlock => "INSPECT_BLOCK",
         _ => throw new ArgumentOutOfRangeException(nameof(action), action, null)
     };
 
@@ -206,5 +215,7 @@ public sealed class SocialGraphPermissionClient(
         bool? Allowed,
         bool? IsFriend,
         bool? BlockedEitherDirection,
-        string? Reason);
+        string? Reason,
+        bool? ActorBlockedTarget,
+        bool? TargetBlockedActor);
 }

@@ -17,7 +17,9 @@ public sealed record ConversationView(
     DateTimeOffset UpdatedAt,
     long CurrentSequence,
     IReadOnlyList<ConversationParticipantView> Participants,
-    MessageView? LastMessage);
+    MessageView? LastMessage,
+    bool ViewerHasBlockedDirectUser = false,
+    bool DirectUserHasBlockedViewer = false);
 
 public sealed record ConversationParticipantView(
     long UserId,

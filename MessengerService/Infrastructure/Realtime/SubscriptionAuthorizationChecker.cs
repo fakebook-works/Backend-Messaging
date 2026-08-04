@@ -37,6 +37,22 @@ public sealed class SubscriptionAuthorizationChecker(IServiceScopeFactory scopeF
             : SubscriptionEventAuthorization.Terminate;
     }
 
+    public async Task<SubscriptionEventAuthorization> AuthorizeConversationEventAsync(
+        long userId,
+        Guid conversationId,
+        RealtimeEvent message,
+        CancellationToken cancellationToken = default)
+    {
+        var membership = await AuthorizeConversationEventAsync(userId, conversationId, cancellationToken);
+        if (membership != SubscriptionEventAuthorization.Allow ||
+            message.UserId is not { } subjectUserId || subjectUserId == userId)
+        {
+            return membership;
+        }
+
+        return await AuthorizeBlockedSubjectAsync(userId, subjectUserId, cancellationToken);
+    }
+
     public async Task<SubscriptionEventAuthorization> AuthorizeInboxEventAsync(
         long userId,
         RealtimeEvent message,
@@ -67,6 +83,17 @@ public sealed class SubscriptionAuthorizationChecker(IServiceScopeFactory scopeF
         if (message.Kind == RealtimeEventKinds.MemberRemoved && message.UserId == userId)
         {
             return SubscriptionEventAuthorization.Allow;
+        }
+
+        if (message.UserId is { } subjectUserId && subjectUserId != userId)
+        {
+            var blockDecision = await AuthorizeBlockedSubjectAsync(userId, subjectUserId, cancellationToken);
+            if (blockDecision != SubscriptionEventAuthorization.Allow)
+            {
+                return blockDecision == SubscriptionEventAuthorization.Terminate
+                    ? SubscriptionEventAuthorization.Skip
+                    : blockDecision;
+            }
         }
 
         return state.CanAccessConversation
@@ -102,9 +129,56 @@ public sealed class SubscriptionAuthorizationChecker(IServiceScopeFactory scopeF
             return SubscriptionEventAuthorization.Terminate;
         }
 
+        if (viewerUserId != subjectUserId)
+        {
+            var blockDecision = await AuthorizeBlockedSubjectAsync(
+                viewerUserId,
+                subjectUserId,
+                cancellationToken);
+            if (blockDecision != SubscriptionEventAuthorization.Allow)
+            {
+                return blockDecision == SubscriptionEventAuthorization.Terminate
+                    ? SubscriptionEventAuthorization.Skip
+                    : blockDecision;
+            }
+        }
+
         return state.CanSeeSubject
             ? SubscriptionEventAuthorization.Allow
             : SubscriptionEventAuthorization.Skip;
+    }
+
+    private async Task<SubscriptionEventAuthorization> AuthorizeBlockedSubjectAsync(
+        long viewerUserId,
+        long subjectUserId,
+        CancellationToken cancellationToken)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var permissionClient = scope.ServiceProvider.GetService<ISocialGraphPermissionClient>();
+        // Unit/test hosts that do not register SocialGraph retain the existing
+        // membership-only behavior. Production always registers the client.
+        if (permissionClient is null)
+        {
+            return SubscriptionEventAuthorization.Allow;
+        }
+
+        try
+        {
+            var result = await permissionClient.CheckAsync(
+                viewerUserId,
+                [subjectUserId],
+                SocialGraphPermissionAction.InspectBlock,
+                cancellationToken);
+            var decision = result.Decisions.SingleOrDefault(value => value.TargetUserId == subjectUserId);
+            return decision is null || decision.BlockedEitherDirection
+                ? SubscriptionEventAuthorization.Skip
+                : SubscriptionEventAuthorization.Allow;
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Never leak a realtime event when block state cannot be verified.
+            return SubscriptionEventAuthorization.Skip;
+        }
     }
 
     private sealed record InboxAuthorizationState(bool IsActive, bool CanAccessConversation);

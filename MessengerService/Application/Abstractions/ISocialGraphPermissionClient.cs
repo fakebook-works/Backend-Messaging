@@ -13,7 +13,14 @@ public enum SocialGraphPermissionAction
 {
     CreateDirect,
     SendDirect,
-    AddGroupMembers
+    AddGroupMembers,
+    /// <summary>
+    /// Read-only block-state inspection. This deliberately does not grant a
+    /// messaging operation; it lets Messenger filter group reads/presence and
+    /// expose the two directional states without treating non-friends as
+    /// permission failures.
+    /// </summary>
+    InspectBlock
 }
 
 public sealed record SocialGraphPermissionDecision(
@@ -21,7 +28,9 @@ public sealed record SocialGraphPermissionDecision(
     bool Allowed,
     bool IsFriend,
     bool BlockedEitherDirection,
-    string? Reason);
+    string? Reason,
+    bool ActorBlockedTarget = false,
+    bool TargetBlockedActor = false);
 
 public sealed record SocialGraphPermissionCheckResult(
     IReadOnlyList<SocialGraphPermissionDecision> Decisions);
