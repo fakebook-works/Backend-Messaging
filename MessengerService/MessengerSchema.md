@@ -317,9 +317,10 @@ on message_reactions (user_id);
   The conversation row is physically removed; the existing cascade constraints remove
   participants, messages, attachments and reactions in the same transaction.
 - Before deletion, `CONVERSATION_DELETED` is written to every active participant inbox.
-  Attachment cleanup excludes URLs still referenced by an active message elsewhere, then
-  uses the earliest source sender as `actor_user_id`, preserving Upload Server ownership
-  checks without breaking forwarded/shared media.
+  Attachment cleanup emits exact message/ordinal content and thumbnail references (plus the
+  conversation-avatar reference). Upload Server's shared reference registry decides whether
+  another parent still uses the same URL; no URL-wide ownership guess or cross-conversation
+  scan is used.
 - Group title/avatar/member/role changes still emit realtime invalidation hints, and now
   also append durable `kind = 'System'` messages inside the same transaction. The existing
   `sender_user_id` is the trusted actor; `system_event` selects the renderer and
@@ -346,4 +347,8 @@ on message_reactions (user_id);
 - `media_type` là snapshot phân loại `image`, `video`, `audio` hoặc `file`; đây không phải foreign key hay bảng con theo từng loại media.
 - `content_type`, `original_name` và `size_bytes` giữ metadata Upload Server trả về để frontend không phải suy luận lại từ URL sau khi reload.
 - `width`, `height`, `duration_ms` và `thumbnail_url` là metadata tùy chọn cho collage, video và audio. Dữ liệu cũ có thể để `NULL` và được suy luận tạm từ URL/content type.
+- Reference vòng đời không lưu thành cột song song: Messenger suy ra ổn định từ parent canonical,
+  `messenger:message:{messageId}:attachment:{ordinal}:content|thumbnail` và
+  `messenger:conversation:{conversationId}:avatar`. Vì vậy retry và xoá group/tin nhắn luôn detach
+  đúng parent, không suy đoán ownership hay xoá theo URL dùng chung.
 - File vật lý và trạng thái pending/committed không được nhân đôi trong schema này; Upload Server là nguồn dữ liệu chính cho vòng đời asset.

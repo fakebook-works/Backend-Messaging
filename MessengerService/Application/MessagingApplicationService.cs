@@ -24,10 +24,12 @@ public sealed class MessagingApplicationService(
     ITopicEventSender topicSender,
     OutboxWakeSignal outboxWakeSignal,
     TimeProvider timeProvider,
-    IOptions<MessagingRulesOptions> rulesOptions)
+    IOptions<MessagingRulesOptions> rulesOptions,
+    IUploadMediaClient? uploadMediaClient = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int PermissionBatchSize = 100;
+    private const int CanonicalMediaCandidateLimit = 8;
     private static readonly IReadOnlySet<long> EmptyUserIdSet = new HashSet<long>();
     private readonly MessagingRulesOptions _rules = rulesOptions.Value;
 
@@ -279,12 +281,20 @@ public sealed class MessagingApplicationService(
         await RequireSocialPermissionAsync(actorUserId, members,
             SocialGraphPermissionAction.AddGroupMembers, cancellationToken);
         await EnsureActiveUserProjectionsAsync(members, cancellationToken);
-
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        await LockActiveUsersAsync(members.Append(actorUserId), cancellationToken);
+        AuthorizedMediaReference? avatarReservation = null;
+        var mediaOperationAt = timeProvider.GetUtcNow();
+        var committed = false;
+        var commitAttempted = false;
+        try
+        {
+            await LockActiveUsersAsync(members.Append(actorUserId), cancellationToken);
 
         var now = timeProvider.GetUtcNow();
+        mediaOperationAt = string.IsNullOrWhiteSpace(command.AvatarUrl)
+            ? now
+            : await GetMediaOperationTimeAsync(cancellationToken);
         var conversation = new Conversation
         {
             Id = Guid.NewGuid(),
@@ -303,10 +313,52 @@ public sealed class MessagingApplicationService(
         db.Conversations.Add(conversation);
         var ev = NewEvent(RealtimeEventKinds.ConversationCreated, now, conversation.Id, userId: actorUserId);
         EnqueueEvent(ev, [RealtimeTopics.Conversation(conversation.Id), .. members.Append(actorUserId).Select(RealtimeTopics.Inbox)]);
+        var avatarReference = conversation.AvatarUrl is null
+            ? null
+            : MediaLifecycleOutbox.ConversationAvatar(conversation.Id, conversation.AvatarUrl);
+        if (avatarReference is not null)
+        {
+            await RequireExactMediaAuthorizationAsync(
+                [avatarReference],
+                actorUserId,
+                mediaOperationAt,
+                cancellationToken);
+            avatarReservation = new AuthorizedMediaReference(avatarReference, actorUserId);
+        }
+        var avatarEvent = avatarReference is null
+            ? null
+            : MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Finalize,
+                [avatarReference],
+                mediaOperationAt,
+                conversation.Id,
+                actorUserId: actorUserId);
+        if (avatarEvent is not null)
+        {
+            db.OutboxEvents.Add(avatarEvent);
+        }
         await db.SaveChangesAsync(cancellationToken);
         var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
+        commitAttempted = true;
         await transaction.CommitAsync(cancellationToken);
+        committed = true;
+        if (avatarEvent is not null)
+        {
+            outboxWakeSignal.Pulse();
+        }
         return result;
+        }
+        catch
+        {
+            if (!committed && !commitAttempted)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+                await CancelAuthorizedReferencesBestEffortAsync(
+                    avatarReservation is null ? [] : [avatarReservation],
+                    mediaOperationAt);
+            }
+            throw;
+        }
     }
 
     public async Task<ConversationView> UpdateGroupConversationAsync(
@@ -319,9 +371,31 @@ public sealed class MessagingApplicationService(
         {
             Throw(MessagingErrorCodes.InvalidInput, "At least one group field must be supplied.");
         }
+        var requestedAvatarUrl = command.HasAvatarUrl ? NormalizeOptional(command.AvatarUrl) : null;
+        var avatarWasCurrentAtPreflight = false;
+        if (command.HasAvatarUrl)
+        {
+            ValidateOptionalMediaUrl(command.AvatarUrl);
+            // Verify administration before reserving the caller's upload, then recheck
+            // under the conversation lock below before persisting the change.
+            var preflight = await RequireGroupAdminAsync(
+                command.ConversationId,
+                actorUserId,
+                cancellationToken);
+            avatarWasCurrentAtPreflight = string.Equals(
+                preflight.AvatarUrl,
+                requestedAvatarUrl,
+                StringComparison.Ordinal);
+        }
 
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        AuthorizedMediaReference? avatarReservation = null;
+        var mediaOperationAt = timeProvider.GetUtcNow();
+        var committed = false;
+        var commitAttempted = false;
+        try
+        {
         var conversation = await LockGroupConversationForAdminAsync(
             command.ConversationId,
             actorUserId,
@@ -336,15 +410,26 @@ public sealed class MessagingApplicationService(
         }
 
         var avatarChanged = false;
+        string? previousAvatarUrl = null;
         if (command.HasAvatarUrl)
         {
-            ValidateOptionalMediaUrl(command.AvatarUrl);
-            var avatarUrl = NormalizeOptional(command.AvatarUrl);
-            avatarChanged = !string.Equals(conversation.AvatarUrl, avatarUrl, StringComparison.Ordinal);
-            conversation.AvatarUrl = avatarUrl;
+            avatarChanged = !string.Equals(conversation.AvatarUrl, requestedAvatarUrl, StringComparison.Ordinal);
+            if (avatarChanged && avatarWasCurrentAtPreflight &&
+                MediaLifecycleOutbox.ManagedUrls([requestedAvatarUrl]).Count > 0)
+            {
+                // The avatar changed between the no-op preflight and the locked write.
+                // Do not turn that race into a way to reattach media the actor did not
+                // prove ownership of; the client can retry against the current state.
+                Throw(MessagingErrorCodes.Conflict, "The group avatar changed; retry the operation.");
+            }
+            previousAvatarUrl = conversation.AvatarUrl;
+            conversation.AvatarUrl = requestedAvatarUrl;
         }
 
         var now = timeProvider.GetUtcNow();
+        mediaOperationAt = command.HasAvatarUrl
+            ? await GetMediaOperationTimeAsync(cancellationToken)
+            : now;
         conversation.UpdatedAt = now;
         var recipients = await ActiveParticipantIdsAsync(conversation.Id, cancellationToken);
         if (titleChanged)
@@ -374,27 +459,63 @@ public sealed class MessagingApplicationService(
         }
         EnqueueEvent(NewEvent(RealtimeEventKinds.ConversationUpdated, now, conversation.Id, userId: actorUserId),
             [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
-        if (command.HasAvatarUrl && conversation.AvatarUrl is not null)
+        var mediaLifecycleQueued = false;
+        if (avatarChanged && previousAvatarUrl is not null)
         {
+            var detachAvatarEvent = MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Delete,
+                [MediaLifecycleOutbox.ConversationAvatar(conversation.Id, previousAvatarUrl)],
+                mediaOperationAt,
+                conversation.Id);
+            if (detachAvatarEvent is not null)
+            {
+                db.OutboxEvents.Add(detachAvatarEvent);
+                mediaLifecycleQueued = true;
+            }
+        }
+        if (avatarChanged && conversation.AvatarUrl is not null)
+        {
+            var avatarReference = MediaLifecycleOutbox.ConversationAvatar(conversation.Id, conversation.AvatarUrl);
+            await RequireExactMediaAuthorizationAsync(
+                [avatarReference],
+                actorUserId,
+                mediaOperationAt,
+                cancellationToken);
+            avatarReservation = new AuthorizedMediaReference(avatarReference, actorUserId);
             var finalizeAvatarEvent = MediaLifecycleOutbox.Create(
                 MediaLifecycleEventKinds.Finalize,
-                [conversation.AvatarUrl],
-                now,
+                [avatarReference],
+                mediaOperationAt,
                 conversation.Id,
                 actorUserId: actorUserId);
             if (finalizeAvatarEvent is not null)
             {
                 db.OutboxEvents.Add(finalizeAvatarEvent);
+                mediaLifecycleQueued = true;
             }
         }
         await db.SaveChangesAsync(cancellationToken);
         var result = await MapConversationAsync(conversation, cancellationToken, actorUserId);
+        commitAttempted = true;
         await transaction.CommitAsync(cancellationToken);
-        if (command.HasAvatarUrl)
+        committed = true;
+        if (mediaLifecycleQueued)
         {
             outboxWakeSignal.Pulse();
         }
         return result;
+        }
+        catch
+        {
+            if (!committed && !commitAttempted)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+                await CancelAuthorizedReferencesBestEffortAsync(
+                    avatarReservation is null ? [] : [avatarReservation],
+                    mediaOperationAt);
+            }
+            throw;
+        }
     }
 
     public async Task<ConversationView> AddConversationMembersAsync(
@@ -527,73 +648,44 @@ public sealed class MessagingApplicationService(
             .Where(attachment => attachment.Message.ConversationId == conversation.Id)
             .Select(attachment => new
             {
+                attachment.MessageId,
+                attachment.Ordinal,
                 attachment.Url,
                 attachment.ThumbnailUrl
             })
             .ToListAsync(cancellationToken);
 
         var now = timeProvider.GetUtcNow();
-        var candidateUrls = conversationMedia
-            .SelectMany(media => new[] { media.Url, media.ThumbnailUrl })
-            .OfType<string>()
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+        var mediaOperationAt = await GetMediaOperationTimeAsync(cancellationToken);
+        var conversationReferences = conversationMedia
+            .SelectMany(media => MediaLifecycleOutbox.MessageAttachment(
+                media.MessageId,
+                media.Ordinal,
+                media.Url,
+                media.ThumbnailUrl))
             .ToArray();
-        var survivingRows = candidateUrls.Length == 0
-            ? []
-            : await db.MessageAttachments.AsNoTracking()
-                .Where(attachment =>
-                    attachment.Message.ConversationId != conversation.Id &&
-                    attachment.Message.DeletedAt == null &&
-                    (candidateUrls.Contains(attachment.Url) ||
-                     (attachment.ThumbnailUrl != null && candidateUrls.Contains(attachment.ThumbnailUrl))))
-                .Select(attachment => new { attachment.Url, attachment.ThumbnailUrl })
-                .ToListAsync(cancellationToken);
-        var survivingUrls = survivingRows
-            .SelectMany(media => new[] { media.Url, media.ThumbnailUrl })
-            .OfType<string>()
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var deletableUrls = candidateUrls
-            .Where(url => !survivingUrls.Contains(url))
-            .ToArray();
-        var ownershipRows = deletableUrls.Length == 0
-            ? []
-            : await db.MessageAttachments.AsNoTracking()
-                .Where(attachment =>
-                    deletableUrls.Contains(attachment.Url) ||
-                    (attachment.ThumbnailUrl != null && deletableUrls.Contains(attachment.ThumbnailUrl)))
-                .Select(attachment => new
-                {
-                    attachment.Url,
-                    attachment.ThumbnailUrl,
-                    attachment.Message.SenderUserId,
-                    attachment.Message.CreatedAt
-                })
-                .ToListAsync(cancellationToken);
-        var ownerByUrl = ownershipRows
-            .SelectMany(media => new (string? Url, long SenderUserId, DateTimeOffset CreatedAt)[]
-            {
-                (media.Url, media.SenderUserId, media.CreatedAt),
-                (media.ThumbnailUrl, media.SenderUserId, media.CreatedAt)
-            })
-            .Where(media => media.Url is not null && deletableUrls.Contains(media.Url))
-            .GroupBy(media => media.Url!, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(
-                group => group.Key,
-                group => group.OrderBy(media => media.CreatedAt).ThenBy(media => media.SenderUserId).First().SenderUserId,
-                StringComparer.OrdinalIgnoreCase);
-        foreach (var ownerGroup in deletableUrls
-                     .Where(ownerByUrl.ContainsKey)
-                     .GroupBy(url => ownerByUrl[url]))
+        foreach (var batch in conversationReferences.Chunk(MediaLifecycleOutbox.MaxReferencesPerEvent))
         {
             var mediaEvent = MediaLifecycleOutbox.Create(
                 MediaLifecycleEventKinds.Delete,
-                ownerGroup,
-                now,
-                conversation.Id,
-                actorUserId: ownerGroup.Key);
+                batch,
+                mediaOperationAt,
+                conversation.Id);
             if (mediaEvent is not null)
             {
                 db.OutboxEvents.Add(mediaEvent);
+            }
+        }
+        if (conversation.AvatarUrl is not null)
+        {
+            var avatarEvent = MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Delete,
+                [MediaLifecycleOutbox.ConversationAvatar(conversation.Id, conversation.AvatarUrl)],
+                mediaOperationAt,
+                conversation.Id);
+            if (avatarEvent is not null)
+            {
+                db.OutboxEvents.Add(avatarEvent);
             }
         }
 
@@ -758,6 +850,11 @@ public sealed class MessagingApplicationService(
             await EnsureMessageVisibleAsync(actorUserId, repliedMessage, cancellationToken);
         }
 
+        var mediaOwnerCandidates = await ResolveManagedMediaOwnerCandidatesAsync(
+            actorUserId,
+            attachments.SelectMany(attachment => new[] { attachment.Url, attachment.ThumbnailUrl }),
+            cancellationToken);
+
         db.ChangeTracker.Clear();
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
         var usersToLock = conversation.Type == ConversationType.Direct
@@ -780,6 +877,9 @@ public sealed class MessagingApplicationService(
         var senderParticipant = await RequireParticipantAsync(conversation.Id, actorUserId, cancellationToken);
         conversation.CurrentSequence++;
         var now = timeProvider.GetUtcNow();
+        var mediaOperationAt = mediaOwnerCandidates.Count == 0
+            ? now
+            : await GetMediaOperationTimeAsync(cancellationToken);
         conversation.UpdatedAt = now;
         var message = new Message
         {
@@ -818,25 +918,57 @@ public sealed class MessagingApplicationService(
         var ev = NewEvent(RealtimeEventKinds.MessageAdded, now, conversation.Id, message.Id,
             actorUserId, message.Sequence);
         EnqueueEvent(ev, [RealtimeTopics.Conversation(conversation.Id), .. recipients.Select(RealtimeTopics.Inbox)]);
-        var finalizeMediaEvent = MediaLifecycleOutbox.Create(
-            MediaLifecycleEventKinds.Finalize,
-            attachments.Select(attachment => attachment.Url!),
-            now,
-            conversation.Id,
-            message.Id,
-            actorUserId);
-        if (finalizeMediaEvent is not null)
+        var mediaReferences = attachments.SelectMany((attachment, ordinal) =>
+                MediaLifecycleOutbox.MessageAttachment(
+                    message.Id,
+                    ordinal,
+                    attachment.Url!,
+                    attachment.ThumbnailUrl))
+            .Where(reference => mediaOwnerCandidates.ContainsKey(reference.Url))
+            .ToArray();
+        var authorizedReferences = new List<AuthorizedMediaReference>(mediaReferences.Length);
+        try
         {
-            db.OutboxEvents.Add(finalizeMediaEvent);
+            foreach (var reference in mediaReferences)
+            {
+                var ownerUserId = await RequireExactMediaAuthorizationAsync(
+                    [reference],
+                    mediaOwnerCandidates[reference.Url],
+                    mediaOperationAt,
+                    cancellationToken);
+                authorizedReferences.Add(new AuthorizedMediaReference(reference, ownerUserId));
+            }
         }
+        catch
+        {
+            await CancelAuthorizedReferencesBestEffortAsync(authorizedReferences, mediaOperationAt);
+            throw;
+        }
+        foreach (var ownerGroup in authorizedReferences.GroupBy(item => item.OwnerUserId))
+        {
+            var finalizeMediaEvent = MediaLifecycleOutbox.Create(
+                MediaLifecycleEventKinds.Finalize,
+                ownerGroup.Select(item => item.Reference),
+                mediaOperationAt,
+                conversation.Id,
+                message.Id,
+                ownerGroup.Key);
+            if (finalizeMediaEvent is not null)
+            {
+                db.OutboxEvents.Add(finalizeMediaEvent);
+            }
+        }
+        var commitAttempted = false;
         try
         {
             await db.SaveChangesAsync(cancellationToken);
+            commitAttempted = true;
             await transaction.CommitAsync(cancellationToken);
         }
-        catch (DbUpdateException)
+        catch (DbUpdateException) when (!commitAttempted)
         {
-            await transaction.RollbackAsync(cancellationToken);
+            await transaction.RollbackAsync(CancellationToken.None);
+            await CancelAuthorizedReferencesBestEffortAsync(authorizedReferences, mediaOperationAt);
             db.ChangeTracker.Clear();
             var winner = await db.Messages.AsNoTracking().SingleOrDefaultAsync(
                 m => m.SenderUserId == actorUserId && m.ClientMessageId == command.ClientMessageId,
@@ -852,6 +984,15 @@ public sealed class MessagingApplicationService(
             }
 
             return await MapMessageAsync(winner, cancellationToken);
+        }
+        catch
+        {
+            if (!commitAttempted)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+                await CancelAuthorizedReferencesBestEffortAsync(authorizedReferences, mediaOperationAt);
+            }
+            throw;
         }
 
         outboxWakeSignal.Pulse();
@@ -974,45 +1115,56 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.InvalidInput, "System messages cannot be deleted.");
         }
 
+        var attachments = await db.MessageAttachments
+            .Where(attachment => attachment.MessageId == message.Id)
+            .OrderBy(attachment => attachment.Ordinal)
+            .ToArrayAsync(cancellationToken);
+        var mediaLifecycleQueued = false;
         if (message.DeletedAt is null)
         {
             var now = timeProvider.GetUtcNow();
-            var attachmentUrls = await db.MessageAttachments
-                .AsNoTracking()
-                .Where(attachment => attachment.MessageId == message.Id)
-                .Select(attachment => attachment.Url)
-                .Distinct()
-                .ToArrayAsync(cancellationToken);
-            var sharedUrls = attachmentUrls.Length == 0
-                ? []
-                : await db.MessageAttachments
-                    .AsNoTracking()
-                    .Where(attachment =>
-                        attachment.MessageId != message.Id &&
-                        attachmentUrls.Contains(attachment.Url) &&
-                        attachment.Message.DeletedAt == null)
-                    .Select(attachment => attachment.Url)
-                    .Distinct()
-                    .ToArrayAsync(cancellationToken);
             message.DeletedAt = now;
             EnqueueEvent(NewEvent(RealtimeEventKinds.MessageDeleted, now, message.ConversationId,
                 message.Id, actorUserId, message.Sequence), RealtimeTopics.Conversation(message.ConversationId));
-            var deleteMediaEvent = MediaLifecycleOutbox.Create(
-                MediaLifecycleEventKinds.Delete,
-                attachmentUrls.Except(sharedUrls, StringComparer.OrdinalIgnoreCase),
-                now,
-                message.ConversationId,
-                message.Id,
-                actorUserId);
-            if (deleteMediaEvent is not null)
-            {
-                db.OutboxEvents.Add(deleteMediaEvent);
-            }
-            await db.SaveChangesAsync(cancellationToken);
         }
+
+        // Re-emitting an exact detach for an already deleted message repairs rows created by
+        // an older deployment whose process died before publishing its cleanup outbox. The
+        // stable reference makes this safe even if the URL has since been reused elsewhere.
+        var mediaOperationAt = attachments.Length == 0
+            ? message.DeletedAt ?? timeProvider.GetUtcNow()
+            : await GetMediaOperationTimeAsync(cancellationToken);
+        var deleteMediaEvent = MediaLifecycleOutbox.Create(
+            MediaLifecycleEventKinds.Delete,
+            attachments.SelectMany(attachment =>
+                MediaLifecycleOutbox.MessageAttachment(
+                    message.Id,
+                    attachment.Ordinal,
+                    attachment.Url,
+                    attachment.ThumbnailUrl)),
+            mediaOperationAt,
+            message.ConversationId,
+            message.Id);
+        if (deleteMediaEvent is not null)
+        {
+            db.OutboxEvents.Add(deleteMediaEvent);
+            mediaLifecycleQueued = true;
+        }
+        if (attachments.Length > 0)
+        {
+            // The durable exact-detach outbox above is the recovery source. Retaining the
+            // attachment rows after a user-visible deletion would keep URLs, original file
+            // names and media metadata indefinitely even though the message is tombstoned.
+            db.MessageAttachments.RemoveRange(attachments);
+        }
+        await db.SaveChangesAsync(cancellationToken);
 
         var result = await MapMessageAsync(message, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        if (mediaLifecycleQueued)
+        {
+            outboxWakeSignal.Pulse();
+        }
         return result;
     }
 
@@ -1414,7 +1566,7 @@ public sealed class MessagingApplicationService(
         if (targets.Any(target => !decisions[target].Allowed))
         {
             Throw(MessagingErrorCodes.DirectMessageForbidden,
-                "Friendship or block rules do not allow this messaging operation.");
+                "Current social-graph rules do not allow this messaging operation.");
         }
     }
 
@@ -1473,12 +1625,12 @@ public sealed class MessagingApplicationService(
         if (friendIdsWithoutConversation.Length > 0)
         {
             // Friends may see one another's active status before the first direct
-            // conversation is created. SocialGraph remains the source of truth for
-            // friendship and block rules; non-friends still fail closed.
+            // conversation is created. This uses a dedicated friend-only action so
+            // opening direct messages to unblocked users does not widen presence.
             await RequireSocialPermissionAsync(
                 viewerId,
                 friendIdsWithoutConversation,
-                SocialGraphPermissionAction.CreateDirect,
+                SocialGraphPermissionAction.ViewPresence,
                 cancellationToken);
         }
 
@@ -1959,12 +2111,234 @@ public sealed class MessagingApplicationService(
         long? sequence = null, DateTimeOffset? expiresAt = null) =>
         new(Guid.NewGuid(), kind, conversationId, messageId, userId, sequence, occurredAt, expiresAt);
 
+    private Task<DateTimeOffset> GetMediaOperationTimeAsync(CancellationToken cancellationToken)
+    {
+        if (!db.Database.IsRelational())
+        {
+            return Task.FromResult(timeProvider.GetUtcNow());
+        }
+
+        // Every Messenger replica shares PostgreSQL, so its clock provides one ordering
+        // domain for serialized parent mutations. Upload must never order exact-reference
+        // attach/detach using a potentially skewed application-host clock.
+        return db.Database
+            .SqlQueryRaw<DateTimeOffset>("SELECT clock_timestamp() AS \"Value\"")
+            .SingleAsync(cancellationToken);
+    }
+
+    private async Task<long> RequireExactMediaAuthorizationAsync(
+        IReadOnlyCollection<UploadMediaReference> references,
+        long ownerUserId,
+        DateTimeOffset operationAt,
+        CancellationToken cancellationToken)
+    {
+        return await RequireExactMediaAuthorizationAsync(
+            references,
+            [ownerUserId],
+            operationAt,
+            cancellationToken);
+    }
+
+    private async Task<long> RequireExactMediaAuthorizationAsync(
+        IReadOnlyCollection<UploadMediaReference> references,
+        IReadOnlyList<long> ownerCandidates,
+        DateTimeOffset operationAt,
+        CancellationToken cancellationToken)
+    {
+        if (references.Count == 0)
+        {
+            throw new ArgumentException("An exact media authorization requires a reference.", nameof(references));
+        }
+        if (uploadMediaClient is null)
+        {
+            throw new InvalidOperationException("The Upload media authorization client is unavailable.");
+        }
+
+        foreach (var ownerUserId in ownerCandidates.Where(id => id > 0).Distinct())
+        {
+            UploadMediaAuthorizationResult authorization;
+            try
+            {
+                authorization = await uploadMediaClient.AuthorizeReferencesAsync(
+                    references,
+                    ownerUserId,
+                    operationAt,
+                    cancellationToken);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                Throw(MessagingErrorCodes.UploadMediaUnavailable, "Media ownership could not be verified.");
+                return 0;
+            }
+            catch (HttpRequestException)
+            {
+                Throw(MessagingErrorCodes.UploadMediaUnavailable, "Media ownership could not be verified.");
+                return 0;
+            }
+
+            if (authorization.Authorized)
+            {
+                return ownerUserId;
+            }
+        }
+
+        // Keep the response deliberately generic so ownership probing cannot distinguish
+        // another user's asset from a missing/deleted file.
+        Throw(MessagingErrorCodes.AttachmentUrlNotAllowed, "Media could not be attached.");
+        return 0;
+    }
+
+    private async Task CancelAuthorizedReferencesBestEffortAsync(
+        IReadOnlyCollection<AuthorizedMediaReference> authorizedReferences,
+        DateTimeOffset operationAt)
+    {
+        if (uploadMediaClient is null || authorizedReferences.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var ownerGroup in authorizedReferences.GroupBy(item => item.OwnerUserId))
+        {
+            try
+            {
+                await uploadMediaClient.DeleteReferencesAsync(
+                    ownerGroup.Select(item => item.Reference).ToArray(),
+                    ownerGroup.Key,
+                    operationAt,
+                    CancellationToken.None);
+            }
+            catch (Exception exception) when (exception is HttpRequestException or OperationCanceledException or InvalidOperationException)
+            {
+                _ = exception;
+                // Do not hide the parent transaction failure. Upload expires pending exact
+                // reservations after a bounded interval when this best-effort compensation
+                // cannot reach it.
+            }
+        }
+    }
+
+    private sealed record AuthorizedMediaReference(UploadMediaReference Reference, long OwnerUserId);
+
     private void ValidateOptionalMediaUrl(string? value)
     {
         if (!string.IsNullOrWhiteSpace(value))
         {
             ValidateMediaUrl(value);
         }
+    }
+
+    private async Task<IReadOnlyDictionary<string, IReadOnlyList<long>>> ResolveManagedMediaOwnerCandidatesAsync(
+        long actorUserId,
+        IEnumerable<string?> urls,
+        CancellationToken cancellationToken)
+    {
+        var managedUrls = MediaLifecycleOutbox.ManagedUrls(urls);
+        if (managedUrls.Count == 0)
+        {
+            return new Dictionary<string, IReadOnlyList<long>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var candidatesByUrl = new Dictionary<string, IReadOnlyList<long>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var url in managedUrls)
+        {
+            var canonicalOwners = await ResolveCanonicalMediaOwnerCandidatesAsync(
+                actorUserId,
+                url,
+                cancellationToken);
+            candidatesByUrl[url] = canonicalOwners
+                .Append(actorUserId)
+                .Distinct()
+                .Take(CanonicalMediaCandidateLimit)
+                .ToArray();
+        }
+
+        return candidatesByUrl;
+    }
+
+    private async Task<IReadOnlyList<long>> ResolveCanonicalMediaOwnerCandidatesAsync(
+        long viewerUserId,
+        string url,
+        CancellationToken cancellationToken)
+    {
+        var path = MediaLifecycleOutbox.ManagedPath(url);
+        if (path is null)
+        {
+            return Array.Empty<long>();
+        }
+
+        // A URL is not a capability. First prove that the actor can currently see a
+        // non-deleted canonical message attachment carrying it. Group visibility still
+        // goes through the existing two-way block check below.
+        var visibleCandidates = await db.MessageAttachments.AsNoTracking()
+            .Where(attachment =>
+                attachment.Message.Kind == DomainMessageKind.User &&
+                attachment.Message.DeletedAt == null &&
+                attachment.Message.Conversation.Participants.Any(participant =>
+                    participant.UserId == viewerUserId && participant.LeftAt == null) &&
+                (attachment.Url == url || attachment.ThumbnailUrl == url ||
+                 attachment.Url.EndsWith(path) ||
+                 (attachment.ThumbnailUrl != null && attachment.ThumbnailUrl.EndsWith(path))))
+            .OrderBy(attachment => attachment.Message.CreatedAt)
+            .ThenBy(attachment => attachment.MessageId)
+            .Take(CanonicalMediaCandidateLimit)
+            .Select(attachment => attachment.Message)
+            .ToListAsync(cancellationToken);
+        if (visibleCandidates.Count == 0)
+        {
+            return Array.Empty<long>();
+        }
+
+        var visibleOwnerIds = new List<long>();
+        foreach (var candidate in visibleCandidates)
+        {
+            try
+            {
+                if (candidate.SenderUserId != viewerUserId &&
+                    (await GetBlockedUserIdsAsync(
+                        viewerUserId,
+                        [candidate.SenderUserId],
+                        cancellationToken)).Contains(candidate.SenderUserId))
+                {
+                    continue;
+                }
+                await EnsureMessageVisibleAsync(viewerUserId, candidate, cancellationToken);
+                if (!visibleOwnerIds.Contains(candidate.SenderUserId))
+                {
+                    visibleOwnerIds.Add(candidate.SenderUserId);
+                }
+            }
+            catch (MessagingApplicationException exception)
+                when (exception.Code == MessagingErrorCodes.MessageNotFound)
+            {
+                // A blocked group message is not a usable canonical source. Continue
+                // searching other visible references without revealing this distinction.
+            }
+        }
+        if (visibleOwnerIds.Count == 0)
+        {
+            return Array.Empty<long>();
+        }
+
+        // Forwarding can have happened before this reference-aware deployment. Try a
+        // bounded set of historical senders in creation order so an older source uploader
+        // can be recovered without trusting a browser-supplied owner ID. If no owner can
+        // be verified, fail closed instead of attaching an unowned asset.
+        var historicalOwnerIds = await db.MessageAttachments.AsNoTracking()
+            .Where(attachment =>
+                attachment.Message.Kind == DomainMessageKind.User &&
+                (attachment.Url == url || attachment.ThumbnailUrl == url ||
+                 attachment.Url.EndsWith(path) ||
+                 (attachment.ThumbnailUrl != null && attachment.ThumbnailUrl.EndsWith(path))))
+            .OrderBy(attachment => attachment.Message.CreatedAt)
+            .ThenBy(attachment => attachment.MessageId)
+            .Select(attachment => attachment.Message.SenderUserId)
+            .Take(CanonicalMediaCandidateLimit)
+            .ToListAsync(cancellationToken);
+        return visibleOwnerIds
+            .Concat(historicalOwnerIds)
+            .Distinct()
+            .Take(CanonicalMediaCandidateLimit)
+            .ToArray();
     }
 
     private IReadOnlyList<MessageAttachmentCommand> NormalizeAttachments(SendMessageCommand command)
@@ -2103,7 +2477,7 @@ public sealed class MessagingApplicationService(
         var extension = GetUrlExtension(url);
         return extension switch
         {
-            ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".bmp" => "image",
+            ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".avif" or ".bmp" => "image",
             ".mp4" or ".webm" or ".mov" or ".m4v" => ".webm" == extension ? "audio" : "video",
             ".mp3" or ".m4a" or ".wav" or ".ogg" or ".oga" => "audio",
             _ => "file"
@@ -2118,6 +2492,7 @@ public sealed class MessagingApplicationService(
             ".png" => "image/png",
             ".gif" => "image/gif",
             ".webp" => "image/webp",
+            ".avif" => "image/avif",
             ".mp4" => "video/mp4",
             ".webm" => "audio/webm",
             ".mov" => "video/quicktime",

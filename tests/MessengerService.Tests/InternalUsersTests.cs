@@ -1,5 +1,6 @@
 using MessengerService.Contracts.Internal;
 using MessengerService.Controllers;
+using MessengerService.Application.Media;
 using MessengerService.Application.Realtime;
 using MessengerService.Domain.Entities;
 using MessengerService.Domain.Enums;
@@ -149,6 +150,65 @@ public sealed class MessagingUserProvisioningServiceTests
             ProvisionUserOutcome.DeletedTombstone,
             await service.ProvisionAsync(84, cancellationToken));
         Assert.False(await service.IsActiveAsync(84, cancellationToken));
+    }
+
+    [Fact]
+    public async Task Tombstone_RemovesOwnedAttachmentMetadataAndQueuesExactDetach()
+    {
+        await using var dbContext = CreateContext();
+        var service = new MessagingUserProvisioningService(dbContext);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var now = DateTimeOffset.UtcNow;
+        var conversationId = Guid.NewGuid();
+        var messageId = Guid.NewGuid();
+        dbContext.Users.Add(new MessagingUser
+        {
+            UserId = 42,
+            Status = MessagingUserStatus.Active,
+            CreatedAt = now
+        });
+        dbContext.Conversations.Add(new Conversation
+        {
+            Id = conversationId,
+            Type = ConversationType.Group,
+            Title = "Erasure",
+            CreatedAt = now,
+            UpdatedAt = now,
+            CurrentSequence = 1
+        });
+        dbContext.Messages.Add(new Message
+        {
+            Id = messageId,
+            ConversationId = conversationId,
+            SenderUserId = 42,
+            Sequence = 1,
+            ClientMessageId = Guid.NewGuid(),
+            CreatedAt = now
+        });
+        dbContext.MessageAttachments.Add(new MessageAttachment
+        {
+            MessageId = messageId,
+            Ordinal = 0,
+            Url = "/media/files/content.avif",
+            ThumbnailUrl = "/media/files/thumb.avif",
+            OriginalName = "private-original.jpg",
+            ContentType = "image/avif"
+        });
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        await service.TombstoneAsync(42, cancellationToken);
+
+        Assert.Empty(await dbContext.MessageAttachments.AsNoTracking().ToListAsync(cancellationToken));
+        var detach = Assert.Single(await dbContext.OutboxEvents.AsNoTracking()
+            .Where(item => item.Kind == MediaLifecycleEventKinds.Delete)
+            .ToListAsync(cancellationToken));
+        Assert.Null(detach.ActorUserId);
+        var references = MediaLifecycleOutbox.Deserialize(detach.PayloadJson).References!;
+        Assert.Equal(2, references.Count);
+        Assert.Contains(references, reference =>
+            reference.ReferenceId == $"messenger:message:{messageId:N}:attachment:0:content");
+        Assert.Contains(references, reference =>
+            reference.ReferenceId == $"messenger:message:{messageId:N}:attachment:0:thumbnail");
     }
 
     [Fact]

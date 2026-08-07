@@ -24,6 +24,7 @@ public static class MessagingErrorCodes
     public const string MessageDeleted = "MESSAGE_DELETED";
     public const string EditWindowExpired = "EDIT_WINDOW_EXPIRED";
     public const string AttachmentUrlNotAllowed = "ATTACHMENT_URL_NOT_ALLOWED";
+    public const string UploadMediaUnavailable = "UPLOAD_MEDIA_UNAVAILABLE";
     public const string DirectMessageForbidden = "DIRECT_MESSAGE_FORBIDDEN";
     public const string SocialGraphUnavailable = "SOCIAL_GRAPH_UNAVAILABLE";
     public const string Conflict = "CONFLICT";

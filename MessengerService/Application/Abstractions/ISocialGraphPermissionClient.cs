@@ -15,6 +15,11 @@ public enum SocialGraphPermissionAction
     SendDirect,
     AddGroupMembers,
     /// <summary>
+    /// Allows friends to see presence before their first direct conversation. This
+    /// remains friend-only even though direct messaging itself is open to unblocked users.
+    /// </summary>
+    ViewPresence,
+    /// <summary>
     /// Read-only block-state inspection. This deliberately does not grant a
     /// messaging operation; it lets Messenger filter group reads/presence and
     /// expose the two directional states without treating non-friends as

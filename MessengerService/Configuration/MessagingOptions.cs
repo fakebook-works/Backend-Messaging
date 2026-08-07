@@ -20,6 +20,9 @@ public sealed class MessagingOptions
 
     public int OutboxRetentionHours { get; set; } = 24;
 
+    /// <summary>Retention for semantically dead-lettered rows (never pending rows).</summary>
+    public int OutboxDeadLetterRetentionHours { get; set; } = 168;
+
     public int OutboxCleanupIntervalMinutes { get; set; } = 30;
 }
 
@@ -59,6 +62,11 @@ public sealed class MessagingOptionsValidator : IValidateOptions<MessagingOption
         if (options.OutboxRetentionHours is < 1 or > 720)
         {
             failures.Add("Messaging:OutboxRetentionHours must be between 1 and 720.");
+        }
+
+        if (options.OutboxDeadLetterRetentionHours is < 1 or > 8_760)
+        {
+            failures.Add("Messaging:OutboxDeadLetterRetentionHours must be between 1 and 8760.");
         }
 
         if (options.OutboxCleanupIntervalMinutes is < 1 or > 1_440)

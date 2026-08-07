@@ -5,6 +5,7 @@ using MessengerService.Application.Media;
 using MessengerService.Application.Realtime;
 using MessengerService.Configuration;
 using MessengerService.Infrastructure.Persistence;
+using MessengerService.Infrastructure.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
@@ -21,15 +22,18 @@ public sealed class OutboxDispatcher(
     private const int BatchSize = 50;
 
     /// <summary>
-    /// Attempts after which an event stops being retried.
+    /// Attempts after which an ordinary realtime event stops being retried.
     /// </summary>
     /// <remarks>
     /// There was no ceiling at all: the claim query only filtered on processed_at and
     /// next_attempt_at, so an event that could never succeed — a payload that fails to
     /// deserialize, for instance — was retried every sixty seconds forever, and the cleanup
-    /// pass only removes rows with processed_at set, so it was never purged either.
+    /// pass only removes rows with processed_at set, so it was never purged either. Valid
+    /// media lifecycle events are the deliberate exception: their parent already committed,
+    /// so a transient outage must remain scheduled beyond the ordinary retry ceiling.
     /// </remarks>
-    private const int MaxAttempts = 10;
+    private const int MaxAttempts = OutboxRetryPolicy.MaxOrdinaryAttempts;
+    private const int MaxDurableMediaRetrySeconds = OutboxRetryPolicy.MaxDurableRetrySeconds;
 
     /// <summary>
     /// How long a claimed batch is hidden from other workers while it is being dispatched.
@@ -103,9 +107,14 @@ public sealed class OutboxDispatcher(
                      SELECT *
                      FROM messenger.outbox_events
                      WHERE processed_at IS NULL
-                       AND attempt_count < {MaxAttempts}
+                       AND (attempt_count < {MaxAttempts}
+                            OR kind IN ({MediaLifecycleEventKinds.Finalize}, {MediaLifecycleEventKinds.Delete}))
                        AND (next_attempt_at IS NULL OR next_attempt_at <= {now})
-                     ORDER BY created_at
+                     ORDER BY CASE
+                                WHEN kind IN ({MediaLifecycleEventKinds.Finalize}, {MediaLifecycleEventKinds.Delete}) THEN 0
+                                ELSE 1
+                              END,
+                              created_at
                      FOR UPDATE SKIP LOCKED
                      LIMIT {BatchSize}
                      """)
@@ -132,21 +141,10 @@ public sealed class OutboxDispatcher(
             {
                 if (outboxEvent.Kind is MediaLifecycleEventKinds.Finalize or MediaLifecycleEventKinds.Delete)
                 {
-                    var mediaPayload = MediaLifecycleOutbox.Deserialize(outboxEvent.PayloadJson);
-                    if (outboxEvent.Kind == MediaLifecycleEventKinds.Finalize)
-                    {
-                        await uploadMediaClient.FinalizeAsync(
-                            mediaPayload.Urls,
-                            outboxEvent.ActorUserId,
-                            cancellationToken);
-                    }
-                    else
-                    {
-                        await uploadMediaClient.DeleteAsync(
-                            mediaPayload.Urls,
-                            outboxEvent.ActorUserId,
-                            cancellationToken);
-                    }
+                    await MediaLifecycleOutbox.DispatchAsync(
+                        outboxEvent,
+                        uploadMediaClient,
+                        cancellationToken);
                 }
                 else
                 {
@@ -166,15 +164,43 @@ public sealed class OutboxDispatcher(
             }
             catch (Exception exception)
             {
-                // A payload that will not deserialize cannot succeed on any later attempt, so
-                // it is retired immediately rather than retried every minute until the ceiling.
-                var permanent = exception is JsonException;
-                outboxEvent.AttemptCount = permanent ? MaxAttempts : outboxEvent.AttemptCount + 1;
+                // Poison ordinary realtime payloads retire immediately. Media lifecycle is
+                // durable parent-repair state and therefore remains scheduled even when the
+                // current failure is classified as permanent.
+                var permanent = exception is JsonException or UploadMediaPermanentException;
+                var durableMediaLifecycle =
+                    outboxEvent.Kind is MediaLifecycleEventKinds.Finalize or MediaLifecycleEventKinds.Delete;
+                outboxEvent.AttemptCount = permanent && !durableMediaLifecycle
+                    ? MaxAttempts
+                    : OutboxRetryPolicy.NextAttemptCount(
+                        outboxEvent.AttemptCount,
+                        durableMediaLifecycle);
                 outboxEvent.LastError = Truncate(exception.Message, 4_000);
-                outboxEvent.NextAttemptAt = DateTimeOffset.UtcNow.AddSeconds(
-                    Math.Min(60, Math.Pow(2, Math.Min(outboxEvent.AttemptCount, 6))));
+                var exhaustedOrdinaryEvent = !durableMediaLifecycle && outboxEvent.AttemptCount >= MaxAttempts;
+                outboxEvent.NextAttemptAt = durableMediaLifecycle
+                    ? DateTimeOffset.UtcNow.AddSeconds(Math.Min(
+                        MaxDurableMediaRetrySeconds,
+                        Math.Pow(2, Math.Min(outboxEvent.AttemptCount, 12))))
+                    : permanent || exhaustedOrdinaryEvent
+                        ? null
+                        : DateTimeOffset.UtcNow.AddSeconds(Math.Min(
+                            60,
+                            Math.Pow(2, Math.Min(outboxEvent.AttemptCount, 12))));
 
-                if (outboxEvent.AttemptCount >= MaxAttempts)
+                if (durableMediaLifecycle)
+                {
+                    // The parent state is already committed. Even malformed/permanent-class
+                    // responses remain scheduled: a rolling deployment or offline repair can
+                    // make them dispatchable, while retiring the row would lose the only exact
+                    // attach/detach instruction.
+                    logger.LogWarning(
+                        exception,
+                        "Could not publish durable Messaging media event {EventId} of kind {EventKind}; retry {AttemptCount} remains scheduled.",
+                        outboxEvent.Id,
+                        outboxEvent.Kind,
+                        outboxEvent.AttemptCount);
+                }
+                else if (permanent || exhaustedOrdinaryEvent)
                 {
                     // Left in the table with its error rather than deleted: it is the only
                     // record of an event that was never delivered.
@@ -226,6 +252,17 @@ public sealed class OutboxDispatcher(
             if (deleted > 0)
             {
                 logger.LogInformation("Purged {EventCount} processed Messaging outbox events.", deleted);
+            }
+
+            var deadLetterCutoff = now.AddHours(-options.Value.OutboxDeadLetterRetentionHours);
+            var deadLetters = await dbContext.OutboxEvents
+                .Where(OutboxRetryPolicy.ExpiredDeadLetterPredicate(deadLetterCutoff))
+                .ExecuteDeleteAsync(cancellationToken);
+            if (deadLetters > 0)
+            {
+                logger.LogInformation(
+                    "Purged {EventCount} expired Messaging dead-letter outbox rows; pending/retryable rows were retained.",
+                    deadLetters);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

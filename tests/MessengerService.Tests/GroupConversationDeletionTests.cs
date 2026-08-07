@@ -17,12 +17,19 @@ public sealed class GroupConversationDeletionTests
     {
         await using var db = NewDb();
         var conversation = SeedConversation(db, ConversationType.Group, adminUserId: 11, memberUserId: 22);
+        conversation.AvatarUrl = "/media/files/group-avatar.jpg";
         var firstMessage = NewMessage(conversation.Id, senderUserId: 11, sequence: 1);
         var secondMessage = NewMessage(conversation.Id, senderUserId: 22, sequence: 2);
         secondMessage.ReplyToMessageId = firstMessage.Id;
         db.Messages.AddRange(firstMessage, secondMessage);
         db.MessageAttachments.AddRange(
-            new MessageAttachment { MessageId = firstMessage.Id, Ordinal = 0, Url = "/media/files/admin.jpg" },
+            new MessageAttachment
+            {
+                MessageId = firstMessage.Id,
+                Ordinal = 0,
+                Url = "/media/files/admin.jpg",
+                ThumbnailUrl = "/media/files/admin-thumb.jpg"
+            },
             new MessageAttachment { MessageId = secondMessage.Id, Ordinal = 0, Url = "/media/files/member.jpg" });
         await db.SaveChangesAsync(TestContext.Current.CancellationToken);
 
@@ -46,8 +53,14 @@ public sealed class GroupConversationDeletionTests
             .Where(item => item.Kind == MediaLifecycleEventKinds.Delete)
             .ToListAsync(TestContext.Current.CancellationToken);
         Assert.Equal(2, mediaEvents.Count);
-        Assert.Contains(mediaEvents, item => item.ActorUserId == 11 && item.PayloadJson.Contains("admin.jpg", StringComparison.Ordinal));
-        Assert.Contains(mediaEvents, item => item.ActorUserId == 22 && item.PayloadJson.Contains("member.jpg", StringComparison.Ordinal));
+        Assert.Contains(mediaEvents, item => item.ActorUserId is null &&
+            item.PayloadJson.Contains("admin.jpg", StringComparison.Ordinal) &&
+            item.PayloadJson.Contains("admin-thumb.jpg", StringComparison.Ordinal) &&
+            item.PayloadJson.Contains($"messenger:message:{firstMessage.Id:N}:attachment:0:thumbnail", StringComparison.Ordinal));
+        Assert.Contains(mediaEvents, item => item.ActorUserId is null &&
+            item.PayloadJson.Contains("group-avatar.jpg", StringComparison.Ordinal) &&
+            item.PayloadJson.Contains($"messenger:conversation:{conversation.Id:N}:avatar", StringComparison.Ordinal));
+        Assert.Contains(mediaEvents, item => item.PayloadJson.Contains("member.jpg", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -67,7 +80,7 @@ public sealed class GroupConversationDeletionTests
     }
 
     [Fact]
-    public async Task DeletingGroup_DoesNotDeleteMediaStillReferencedByAnotherActiveMessage()
+    public async Task DeletingGroup_DetachesOnlyItsExactParent_WhenUrlIsSharedByAnotherMessage()
     {
         await using var db = NewDb();
         var conversation = SeedConversation(db, ConversationType.Group, adminUserId: 11, memberUserId: 22);
@@ -93,10 +106,17 @@ public sealed class GroupConversationDeletionTests
             conversation.Id,
             TestContext.Current.CancellationToken);
 
-        Assert.DoesNotContain(
-            await db.OutboxEvents.AsNoTracking().ToListAsync(TestContext.Current.CancellationToken),
-            item => item.Kind == MediaLifecycleEventKinds.Delete &&
-                    item.PayloadJson.Contains("shared.jpg", StringComparison.Ordinal));
+        var mediaEvent = Assert.Single(
+            await db.OutboxEvents.AsNoTracking()
+                .Where(item => item.Kind == MediaLifecycleEventKinds.Delete)
+                .ToListAsync(TestContext.Current.CancellationToken));
+        var payload = MediaLifecycleOutbox.Deserialize(mediaEvent.PayloadJson);
+        var reference = Assert.Single(payload.References!);
+        Assert.Equal("/media/files/shared.jpg", reference.Url);
+        Assert.Equal(
+            $"messenger:message:{removedMessage.Id:N}:attachment:0:content",
+            reference.ReferenceId);
+        Assert.DoesNotContain(survivingMessage.Id.ToString("N"), reference.ReferenceId, StringComparison.Ordinal);
     }
 
     [Fact]

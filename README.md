@@ -5,6 +5,12 @@ messages, reactions, receipts, typing and presence. The public API is GraphQL at
 `/graphql`; SocialGraph provisions and removes local user projections through internal
 REST endpoints.
 
+Direct conversations can be created and used between any two active users unless either user
+blocks the other. SocialGraph remains authoritative for that two-way block check. Creation is
+idempotent for the normalized user pair and returns the existing conversation under both normal
+and concurrent requests. Friendship is still required to view presence before the first shared
+conversation and to add members to a Messenger group.
+
 ## Trust boundaries
 
 - Gateway GraphQL calls must include trusted `X-Gateway-Secret` and `X-User-Id` headers.
@@ -55,11 +61,28 @@ replicas can produce duplicates or deliver later conversation events first. Clie
 deduplicate by `eventId`, apply message `sequence` monotonically, and refetch the
 conversation/messages when a sequence gap is observed.
 
-The transactional outbox also owns staged attachment lifecycle. A successful message
-commit queues `media.finalize.v1`; deleting the final non-deleted message that references
-a URL queues `media.delete.v1`. Upload calls retry with exponential backoff, so closing a
+The transactional outbox also owns staged attachment lifecycle. Before a managed URL is
+persisted, Messenger asks Upload Server over the signed internal API to verify and reserve
+the trusted actor's ownership. Reusing a URL from another message is allowed only when that
+canonical source is currently visible to the actor; Messenger resolves and verifies the
+original Upload owner server-side instead of trusting a browser owner ID. A successful message commit attaches stable references for
+each message/ordinal content slot and optional thumbnail slot; message deletion detaches
+those exact references. Group avatars use one stable conversation reference, including
+creation, replacement, removal and group deletion. The outbox includes the domain operation
+time so late finalize/delete retries cannot overwrite a newer parent state. Legacy URL-only
+outbox rows remain readable through Upload Server's conservative compatibility path, but new
+domain writes never create them. Upload calls retry with exponential backoff, so closing a
 browser immediately after send cannot leave a persisted message pointing at an expiring
-pending asset. Frontend owner-finalization remains safe but is no longer the only guard.
+pending asset. Unlike ordinary realtime invalidations, a well-formed media lifecycle row is
+not permanently dead-lettered after ten transient failures: it retries on a capped schedule.
+The dispatcher does not re-authorize a stale attach, because doing so could renew a reservation
+after a newer detach; Upload applies operation-time tombstones atomically. A malformed
+stored payload is still retired so one corrupt row cannot hot-loop or block unrelated events.
+Exact media references are authorized before a message/avatar transaction commits. Upload must
+acknowledge `exactReferences=true`, `lifecycleVersion>=3`, and the exact reference count; a
+legacy response fails closed. If the parent transaction fails after authorization, Messenger
+best-effort detaches only that attempt's references with the same DB operation timestamp.
+Ownerless online repair is unsupported; legacy missing references require offline reconciliation.
 When the outbox is empty, polling backs off from `Messaging:OutboxPollMilliseconds` to
 `Messaging:OutboxMaxIdlePollMilliseconds` and resets after the next dispatched event,
 reducing idle traffic to an external PostgreSQL server.
@@ -76,10 +99,12 @@ administrator cannot leave or be demoted until another administrator is assigned
 `Group` conversation. Deletion removes the conversation and its cascaded messages,
 participants, attachments and reactions in one transaction. Before the row is removed,
 the service queues `CONVERSATION_DELETED` to each active participant's private inbox.
-Managed message media with no surviving active reference is queued for deletion under
-the original sender's identity, so a group administrator is never treated as the owner
-of another member's upload and forwarded/shared media is not broken. Updating a managed
-group avatar queues `media.finalize.v1` under the acting administrator's identity.
+Every managed message content/thumbnail parent is detached by its exact message/ordinal
+reference, so a group administrator is never treated as the owner of another member's upload
+and a shared URL cannot be deleted by a stale cascade.
+Upload Server deletes the physical asset only after its final exact parent is gone. Updating
+a managed group avatar authorizes and attaches the new asset under the acting administrator,
+while the old conversation reference is detached without guessing its historical owner.
 
 Group title/photo/member/role changes emit realtime invalidation events and append a
 durable structured system message in the same transaction. The existing message sender is

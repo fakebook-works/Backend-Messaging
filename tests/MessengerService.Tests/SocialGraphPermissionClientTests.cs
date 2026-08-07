@@ -89,7 +89,6 @@ public sealed class SocialGraphPermissionClientTests
 
     [Theory]
     [InlineData("{\"results\":[]}")]
-    [InlineData("{\"results\":[{\"targetUserId\":42,\"allowed\":true,\"isFriend\":false,\"blockedEitherDirection\":false}]}")]
     [InlineData("{\"results\":[{\"targetUserId\":42,\"allowed\":true,\"isFriend\":true,\"blockedEitherDirection\":true}]}")]
     [InlineData("not-json")]
     public async Task CheckAsync_InvalidOrUnsafeResponse_FailsClosed(string responseJson)
@@ -103,6 +102,62 @@ public sealed class SocialGraphPermissionClientTests
                 [42],
                 SocialGraphPermissionAction.SendDirect,
                 CancellationToken.None));
+
+        Assert.Equal(MessagingErrorCodes.SocialGraphUnavailable, exception.Code);
+    }
+
+    [Theory]
+    [InlineData(SocialGraphPermissionAction.CreateDirect)]
+    [InlineData(SocialGraphPermissionAction.SendDirect)]
+    public async Task CheckAsync_DirectMessagingAcceptsUnblockedNonFriend(
+        SocialGraphPermissionAction action)
+    {
+        var handler = new StubHttpMessageHandler(
+            HttpStatusCode.OK,
+            """
+            {
+              "results": [{
+                "targetUserId": 42,
+                "allowed": true,
+                "isFriend": false,
+                "blockedEitherDirection": false,
+                "reason": null
+              }]
+            }
+            """);
+        var client = CreateClient(handler);
+
+        var result = await client.CheckAsync(7, [42], action, CancellationToken.None);
+
+        var decision = Assert.Single(result.Decisions);
+        Assert.True(decision.Allowed);
+        Assert.False(decision.IsFriend);
+        Assert.False(decision.BlockedEitherDirection);
+    }
+
+    [Theory]
+    [InlineData(SocialGraphPermissionAction.AddGroupMembers)]
+    [InlineData(SocialGraphPermissionAction.ViewPresence)]
+    public async Task CheckAsync_FriendOnlyActionRejectsAllowedNonFriendResponse(
+        SocialGraphPermissionAction action)
+    {
+        var handler = new StubHttpMessageHandler(
+            HttpStatusCode.OK,
+            """
+            {
+              "results": [{
+                "targetUserId": 42,
+                "allowed": true,
+                "isFriend": false,
+                "blockedEitherDirection": false,
+                "reason": null
+              }]
+            }
+            """);
+        var client = CreateClient(handler);
+
+        var exception = await Assert.ThrowsAsync<MessagingApplicationException>(() =>
+            client.CheckAsync(7, [42], action, CancellationToken.None));
 
         Assert.Equal(MessagingErrorCodes.SocialGraphUnavailable, exception.Code);
     }

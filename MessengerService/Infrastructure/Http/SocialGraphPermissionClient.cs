@@ -152,7 +152,9 @@ public sealed class SocialGraphPermissionClient(
                  result.TargetBlockedActor is { } targetBlocked &&
                  result.BlockedEitherDirection.Value != (actorBlocked || targetBlocked)) ||
                 (action != SocialGraphPermissionAction.InspectBlock && result.Allowed.Value &&
-                 (!result.IsFriend.Value || result.BlockedEitherDirection.Value)))
+                 result.BlockedEitherDirection.Value) ||
+                (action is SocialGraphPermissionAction.AddGroupMembers or SocialGraphPermissionAction.ViewPresence &&
+                 result.Allowed.Value && !result.IsFriend.Value))
             {
                 throw Unavailable();
             }
@@ -193,6 +195,7 @@ public sealed class SocialGraphPermissionClient(
         SocialGraphPermissionAction.CreateDirect => "CREATE_DIRECT",
         SocialGraphPermissionAction.SendDirect => "SEND_DIRECT",
         SocialGraphPermissionAction.AddGroupMembers => "ADD_GROUP_MEMBERS",
+        SocialGraphPermissionAction.ViewPresence => "VIEW_PRESENCE",
         SocialGraphPermissionAction.InspectBlock => "INSPECT_BLOCK",
         _ => throw new ArgumentOutOfRangeException(nameof(action), action, null)
     };

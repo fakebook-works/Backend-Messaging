@@ -1,4 +1,5 @@
 using MessengerService.Contracts.Internal;
+using MessengerService.Application.Media;
 using MessengerService.Application.Realtime;
 using MessengerService.Domain.Entities;
 using MessengerService.Domain.Enums;
@@ -197,6 +198,41 @@ public sealed class MessagingUserProvisioningService(MessagingDbContext dbContex
         bool publishRevocation,
         CancellationToken cancellationToken)
     {
+        // Account erasure must release every exact message/ordinal media parent owned by
+        // this sender. Membership revocation alone leaves the rows (and therefore Upload
+        // references) behind indefinitely. Queue the detach in the same transaction as the
+        // tombstone so a crash cannot produce an erased account with untracked storage pins.
+        var ownedAttachments = await dbContext.MessageAttachments
+            .Where(attachment => attachment.Message.SenderUserId == userId)
+            .ToListAsync(cancellationToken);
+        if (ownedAttachments.Count > 0)
+        {
+            var operationAt = await GetMediaOperationTimeAsync(cancellationToken);
+            var references = ownedAttachments
+                .SelectMany(attachment => MediaLifecycleOutbox.MessageAttachment(
+                    attachment.MessageId,
+                    attachment.Ordinal,
+                    attachment.Url,
+                    attachment.ThumbnailUrl))
+                .ToArray();
+            foreach (var batch in references.Chunk(MediaLifecycleOutbox.MaxReferencesPerEvent))
+            {
+                var mediaEvent = MediaLifecycleOutbox.Create(
+                    MediaLifecycleEventKinds.Delete,
+                    batch,
+                    operationAt);
+                if (mediaEvent is not null)
+                {
+                    dbContext.OutboxEvents.Add(mediaEvent);
+                }
+            }
+
+            // The outbox payload now owns the exact immutable cleanup coordinates. Remove
+            // URL/name/metadata-bearing rows in the same tombstone transaction so account
+            // erasure does not leave personal media metadata retained indefinitely.
+            dbContext.MessageAttachments.RemoveRange(ownedAttachments);
+        }
+
         var presence = lockRows
             ? await dbContext.UserPresences
                 .FromSqlInterpolated(
@@ -335,6 +371,18 @@ public sealed class MessagingUserProvisioningService(MessagingDbContext dbContex
         dbContext.Database.ExecuteSqlInterpolatedAsync(
             $"SELECT pg_advisory_xact_lock({-userId})",
             cancellationToken);
+
+    private Task<DateTimeOffset> GetMediaOperationTimeAsync(CancellationToken cancellationToken)
+    {
+        if (!dbContext.Database.IsRelational())
+        {
+            return Task.FromResult(DateTimeOffset.UtcNow);
+        }
+
+        return dbContext.Database
+            .SqlQueryRaw<DateTimeOffset>("SELECT clock_timestamp() AS \"Value\"")
+            .SingleAsync(cancellationToken);
+    }
 
     private Task<MessagingUser?> LockUserAsync(long userId, CancellationToken cancellationToken) =>
         dbContext.Users
