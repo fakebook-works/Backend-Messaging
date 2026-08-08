@@ -30,6 +30,15 @@ public sealed class MessagingApplicationService(
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int PermissionBatchSize = 100;
     private const int CanonicalMediaCandidateLimit = 8;
+    private const int MaxGroupTitleLength = 120;
+    private const int MaxReactionLength = 32;
+    private const int MaxAttachmentAssetIdLength = 128;
+    private const int MaxAttachmentContentTypeLength = 128;
+    private const int MaxAttachmentNameLength = 255;
+    private const long MaxAttachmentSizeBytes = 500L * 1024 * 1024;
+    private const long MaxAttachmentDurationMilliseconds = 7L * 24 * 60 * 60 * 1000;
+    private const int MaxCursorLength = 128;
+    private const int MaxConversationOffset = 1_000_000;
     private static readonly IReadOnlySet<long> EmptyUserIdSet = new HashSet<long>();
     private readonly MessagingRulesOptions _rules = rulesOptions.Value;
 
@@ -153,14 +162,11 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(userId, cancellationToken);
-        var message = await db.Messages.AsNoTracking()
-            .SingleOrDefaultAsync(value => value.Id == messageId, cancellationToken);
-        if (message is null)
-        {
-            Throw(MessagingErrorCodes.MessageNotFound, "The message does not exist.");
-        }
-
-        await RequireParticipantAsync(message.ConversationId, userId, cancellationToken);
+        var message = await RequireMessageForParticipantAsync(
+            userId,
+            messageId,
+            cancellationToken,
+            asNoTracking: true);
         await EnsureMessageVisibleAsync(userId, message, cancellationToken);
         var hiddenReactionUserIds = await GetHiddenUserIdsForMessageAsync(userId, message, cancellationToken);
         return await MapMessageAsync(message, cancellationToken, hiddenReactionUserIds);
@@ -172,6 +178,13 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(userId, cancellationToken);
+        if (userIds is null || userIds.Count > _rules.MaxPresenceUserIds)
+        {
+            Throw(
+                MessagingErrorCodes.InvalidInput,
+                $"Presence requests support at most {_rules.MaxPresenceUserIds} user IDs.");
+        }
+
         var ids = NormalizeUserIds(userIds, allowEmpty: false);
         RequirePresenceListLimit(ids);
         var blockedUserIds = await RequirePresenceVisibilityAsync(userId, ids, cancellationToken);
@@ -268,6 +281,12 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(actorUserId, cancellationToken);
+        if (command.MemberUserIds is null || command.MemberUserIds.Count > _rules.MaxGroupParticipants)
+        {
+            Throw(MessagingErrorCodes.InvalidInput,
+                $"A group supports at most {_rules.MaxGroupParticipants} participants.");
+        }
+
         var members = NormalizeUserIds(command.MemberUserIds, allowEmpty: false)
             .Where(id => id != actorUserId).ToArray();
         if (members.Length < 2 || members.Length + 1 > _rules.MaxGroupParticipants)
@@ -276,7 +295,8 @@ public sealed class MessagingApplicationService(
                 $"A group requires 3 to {_rules.MaxGroupParticipants} participants.");
         }
 
-        var title = RequireText(command.Title, 120, "Group title");
+        var title = TextInputSanitizer.NormalizeRequired(
+            command.Title, MaxGroupTitleLength, "Group title", allowLineBreaks: false);
         ValidateOptionalMediaUrl(command.AvatarUrl);
         await RequireSocialPermissionAsync(actorUserId, members,
             SocialGraphPermissionAction.AddGroupMembers, cancellationToken);
@@ -300,7 +320,7 @@ public sealed class MessagingApplicationService(
             Id = Guid.NewGuid(),
             Type = ConversationType.Group,
             Title = title,
-            AvatarUrl = NormalizeOptional(command.AvatarUrl),
+            AvatarUrl = NormalizeOptionalUrl(command.AvatarUrl),
             CreatedAt = now,
             UpdatedAt = now
         };
@@ -371,7 +391,7 @@ public sealed class MessagingApplicationService(
         {
             Throw(MessagingErrorCodes.InvalidInput, "At least one group field must be supplied.");
         }
-        var requestedAvatarUrl = command.HasAvatarUrl ? NormalizeOptional(command.AvatarUrl) : null;
+        var requestedAvatarUrl = command.HasAvatarUrl ? NormalizeOptionalUrl(command.AvatarUrl) : null;
         var avatarWasCurrentAtPreflight = false;
         if (command.HasAvatarUrl)
         {
@@ -404,7 +424,12 @@ public sealed class MessagingApplicationService(
         var titleChanged = false;
         if (command.HasTitle)
         {
-            var title = RequireText(command.Title, 120, "Group title");
+            var title = TextInputSanitizer.NormalizeOptional(
+                command.Title, MaxGroupTitleLength, "Group title", allowLineBreaks: false);
+            if (title is null)
+            {
+                Throw(MessagingErrorCodes.InvalidInput, "Group title is required.");
+            }
             titleChanged = !string.Equals(conversation.Title, title, StringComparison.Ordinal);
             conversation.Title = title;
         }
@@ -524,6 +549,12 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(actorUserId, cancellationToken);
+        if (command.UserIds is null || command.UserIds.Count > _rules.MaxGroupParticipants)
+        {
+            Throw(MessagingErrorCodes.InvalidInput,
+                $"A group membership request supports at most {_rules.MaxGroupParticipants} user IDs.");
+        }
+
         var requested = NormalizeUserIds(command.UserIds, allowEmpty: false);
 
         // Run the remote permission check before taking the database lock. The
@@ -782,11 +813,8 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.InvalidInput, "Client message ID cannot be empty.");
         }
 
-        var text = NormalizeOptional(command.Text);
-        if (text is not null && text.Length > _rules.MaxMessageLength)
-        {
-            Throw(MessagingErrorCodes.InvalidInput, $"Message text cannot exceed {_rules.MaxMessageLength} characters.");
-        }
+        var text = TextInputSanitizer.NormalizeOptional(
+            command.Text, _rules.MaxMessageLength, "Message text", allowLineBreaks: true);
 
         if (MessageTextHistoryCodec.IsReservedInput(text))
         {
@@ -1023,9 +1051,13 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(actorUserId, cancellationToken);
-        var message = await RequireMessageAsync(command.MessageId, cancellationToken);
+        var message = await RequireMessageForParticipantAsync(
+            actorUserId,
+            command.MessageId,
+            cancellationToken);
         var conversationId = message.ConversationId;
-        var text = RequireText(command.Text, _rules.MaxMessageLength, "Message text");
+        var text = TextInputSanitizer.NormalizeRequired(
+            command.Text, _rules.MaxMessageLength, "Message text", allowLineBreaks: true);
         if (MessageTextHistoryCodec.IsReservedInput(text))
         {
             Throw(MessagingErrorCodes.InvalidInput, "Message text uses a reserved internal prefix.");
@@ -1091,7 +1123,10 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(actorUserId, cancellationToken);
-        var message = await RequireMessageAsync(command.MessageId, cancellationToken);
+        var message = await RequireMessageForParticipantAsync(
+            actorUserId,
+            command.MessageId,
+            cancellationToken);
         var conversationId = message.ConversationId;
         var conversation = await FindConversationAsync(conversationId, cancellationToken);
         await RequireParticipantAsync(conversationId, actorUserId, cancellationToken);
@@ -1174,12 +1209,12 @@ public sealed class MessagingApplicationService(
         CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(actorUserId, cancellationToken);
-        var message = await RequireMessageAsync(command.MessageId, cancellationToken);
-        var emoji = NormalizeOptional(command.Emoji);
-        if (emoji is { Length: > 32 })
-        {
-            Throw(MessagingErrorCodes.InvalidInput, "A reaction cannot exceed 32 characters.");
-        }
+        var message = await RequireMessageForParticipantAsync(
+            actorUserId,
+            command.MessageId,
+            cancellationToken);
+        var emoji = TextInputSanitizer.NormalizeOptional(
+            command.Emoji, MaxReactionLength, "Reaction", allowLineBreaks: false);
 
         var conversationId = message.ConversationId;
         var conversation = await FindConversationAsync(conversationId, cancellationToken);
@@ -1336,6 +1371,13 @@ public sealed class MessagingApplicationService(
         IReadOnlyCollection<long> userIds, CancellationToken cancellationToken)
     {
         await RequireActiveUserAsync(userId, cancellationToken);
+        if (userIds is null || userIds.Count > _rules.MaxPresenceUserIds)
+        {
+            Throw(
+                MessagingErrorCodes.InvalidInput,
+                $"Presence subscriptions support at most {_rules.MaxPresenceUserIds} user IDs.");
+        }
+
         var ids = NormalizeUserIds(userIds, allowEmpty: false);
         RequirePresenceListLimit(ids);
         var blockedUserIds = await RequirePresenceVisibilityAsync(userId, ids, cancellationToken);
@@ -1756,6 +1798,32 @@ public sealed class MessagingApplicationService(
         var message = await db.Messages.SingleOrDefaultAsync(m => m.Id == messageId, cancellationToken);
         if (message is null)
         {
+            Throw(MessagingErrorCodes.MessageNotFound, "The message does not exist.");
+        }
+
+        return message;
+    }
+
+    private async Task<Message> RequireMessageForParticipantAsync(
+        long userId,
+        Guid messageId,
+        CancellationToken cancellationToken,
+        bool asNoTracking = false)
+    {
+        var query = db.Messages
+            .Where(message => message.Id == messageId &&
+                              message.Conversation.Participants.Any(participant =>
+                                  participant.UserId == userId && participant.LeftAt == null));
+        if (asNoTracking)
+        {
+            query = query.AsNoTracking();
+        }
+
+        var message = await query.SingleOrDefaultAsync(cancellationToken);
+        if (message is null)
+        {
+            // Do not reveal whether an arbitrary message ID exists in a private
+            // conversation to a caller who is not an active participant.
             Throw(MessagingErrorCodes.MessageNotFound, "The message does not exist.");
         }
 
@@ -2346,10 +2414,17 @@ public sealed class MessagingApplicationService(
         var urls = command.AttachmentUrls ?? [];
         var supplied = command.Attachments ?? [];
 
+        if (urls.Count > _rules.MaxAttachmentsPerMessage ||
+            supplied.Count > _rules.MaxAttachmentsPerMessage)
+        {
+            Throw(MessagingErrorCodes.InvalidInput,
+                $"A message supports at most {_rules.MaxAttachmentsPerMessage} attachments.");
+        }
+
         if (supplied.Count == 0)
         {
             return urls
-                .Select(url => new MessageAttachmentCommand(url))
+                .Select(url => new MessageAttachmentCommand(NormalizeOptionalUrl(url)))
                 .ToArray();
         }
 
@@ -2363,8 +2438,8 @@ public sealed class MessagingApplicationService(
         for (var index = 0; index < supplied.Count; index++)
         {
             var suppliedAttachment = supplied[index];
-            var suppliedUrl = NormalizeOptional(suppliedAttachment.Url);
-            var fallbackUrl = urls.Count == 0 ? null : NormalizeOptional(urls[index]);
+            var suppliedUrl = NormalizeOptionalUrl(suppliedAttachment.Url);
+            var fallbackUrl = urls.Count == 0 ? null : NormalizeOptionalUrl(urls[index]);
 
             if (suppliedUrl is not null && fallbackUrl is not null &&
                 !string.Equals(suppliedUrl, fallbackUrl, StringComparison.Ordinal))
@@ -2373,7 +2448,19 @@ public sealed class MessagingApplicationService(
                     "Attachment URL values must match when both attachment contracts are supplied.");
             }
 
-            normalized[index] = suppliedAttachment with { Url = suppliedUrl ?? fallbackUrl };
+            normalized[index] = suppliedAttachment with
+            {
+                Url = suppliedUrl ?? fallbackUrl,
+                AssetId = NormalizeAttachmentAssetId(suppliedAttachment.AssetId),
+                MediaType = NormalizeAttachmentMediaType(suppliedAttachment.MediaType),
+                ContentType = NormalizeAttachmentContentType(suppliedAttachment.ContentType),
+                OriginalName = TextInputSanitizer.NormalizeOptional(
+                    suppliedAttachment.OriginalName,
+                    MaxAttachmentNameLength,
+                    "Attachment file name",
+                    allowLineBreaks: false),
+                ThumbnailUrl = NormalizeOptionalUrl(suppliedAttachment.ThumbnailUrl)
+            };
         }
 
         return normalized;
@@ -2391,7 +2478,8 @@ public sealed class MessagingApplicationService(
         if (!string.IsNullOrWhiteSpace(attachment.AssetId))
         {
             var assetId = attachment.AssetId.Trim();
-            if (assetId.Length > 128 || assetId.Any(char.IsWhiteSpace))
+            if (assetId.Length > MaxAttachmentAssetIdLength ||
+                assetId.Any(character => !IsSafeAttachmentTokenCharacter(character)))
             {
                 Throw(MessagingErrorCodes.InvalidInput, "Attachment asset ID is invalid.");
             }
@@ -2405,13 +2493,13 @@ public sealed class MessagingApplicationService(
         }
 
         if (!string.IsNullOrWhiteSpace(attachment.ContentType) &&
-            attachment.ContentType.Trim().Length > 128)
+            attachment.ContentType.Trim().Length > MaxAttachmentContentTypeLength)
         {
             Throw(MessagingErrorCodes.InvalidInput, "Attachment content type is too long.");
         }
 
         if (!string.IsNullOrWhiteSpace(attachment.OriginalName) &&
-            attachment.OriginalName.Trim().Length > 255)
+            attachment.OriginalName.Trim().Length > MaxAttachmentNameLength)
         {
             Throw(MessagingErrorCodes.InvalidInput, "Attachment original name is too long.");
         }
@@ -2422,9 +2510,19 @@ public sealed class MessagingApplicationService(
             Throw(MessagingErrorCodes.InvalidInput, "Attachment metadata cannot contain negative values.");
         }
 
+        if (attachment.SizeBytes is > MaxAttachmentSizeBytes)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment size is out of range.");
+        }
+
         if (attachment.Width is > 100_000 || attachment.Height is > 100_000)
         {
             Throw(MessagingErrorCodes.InvalidInput, "Attachment dimensions are out of range.");
+        }
+
+        if (attachment.DurationMs is > MaxAttachmentDurationMilliseconds)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment duration is out of range.");
         }
 
         if (!string.IsNullOrWhiteSpace(attachment.ThumbnailUrl))
@@ -2516,8 +2614,24 @@ public sealed class MessagingApplicationService(
 
     private void ValidateMediaUrl(string value)
     {
-        if (!AttachmentUrlPolicy.IsAllowed(
+        // URL syntax is validated separately below. This guard rejects malformed
+        // UTF-16 and bidi/control formatting without rewriting a URL's path.
+        try
+        {
+            TextInputSanitizer.EnsureSafeSyntax(
                 value,
+                _rules.MaxAttachmentUrlLength,
+                "Attachment URL");
+        }
+        catch (MessagingApplicationException exception)
+            when (exception.Code == MessagingErrorCodes.InvalidInput)
+        {
+            Throw(
+                MessagingErrorCodes.AttachmentUrlNotAllowed,
+                "Media URLs must be a managed /media/files path or use HTTPS and an explicitly allowed host.");
+        }
+        if (!AttachmentUrlPolicy.IsAllowed(
+            value,
                 _rules.MaxAttachmentUrlLength,
                 _rules.AllowedAttachmentHosts))
         {
@@ -2525,6 +2639,57 @@ public sealed class MessagingApplicationService(
                 "Media URLs must be a managed /media/files path or use HTTPS and an explicitly allowed host.");
         }
     }
+
+    private static string? NormalizeOptionalUrl(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static string? NormalizeAttachmentAssetId(string? value)
+    {
+        var normalized = TextInputSanitizer.NormalizeOptional(
+            value, MaxAttachmentAssetIdLength, "Attachment asset ID", allowLineBreaks: false);
+        if (normalized is null)
+        {
+            return null;
+        }
+
+        if (normalized.Any(character => !IsSafeAttachmentTokenCharacter(character)))
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment asset ID is invalid.");
+        }
+
+        return normalized;
+    }
+
+    private static string? NormalizeAttachmentMediaType(string? value)
+    {
+        var normalized = TextInputSanitizer.NormalizeOptional(
+            value, 16, "Attachment media type", allowLineBreaks: false);
+        return normalized?.ToLowerInvariant();
+    }
+
+    private static string? NormalizeAttachmentContentType(string? value)
+    {
+        var normalized = TextInputSanitizer.NormalizeOptional(
+            value, MaxAttachmentContentTypeLength, "Attachment content type", allowLineBreaks: false);
+        if (normalized is null)
+        {
+            return null;
+        }
+
+        // MIME types and parameters are ASCII by definition. Refuse Unicode
+        // confusables/control characters instead of persisting an ambiguous type.
+        if (normalized.Any(character => character is < '\x20' or > '\x7E'))
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "Attachment content type is invalid.");
+        }
+
+        return normalized;
+    }
+
+    private static bool IsSafeAttachmentTokenCharacter(char character) =>
+        character is >= 'A' and <= 'Z' or
+            >= 'a' and <= 'z' or
+            >= '0' and <= '9' or '-' or '_' or '.' or ':';
 
     private static ConversationParticipant NewParticipant(Guid conversationId, long userId,
         ParticipantRole role, DateTimeOffset now) => new()
@@ -2546,20 +2711,6 @@ public sealed class MessagingApplicationService(
         return normalized;
     }
 
-    private static string RequireText(string? value, int maxLength, string field)
-    {
-        var text = NormalizeOptional(value);
-        if (text is null || text.Length > maxLength)
-        {
-            Throw(MessagingErrorCodes.InvalidInput, $"{field} is required and cannot exceed {maxLength} characters.");
-        }
-
-        return text;
-    }
-
-    private static string? NormalizeOptional(string? value) =>
-        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-
     private static int RequirePageSize(int value, int maximum)
     {
         if (value is < 1 || value > maximum)
@@ -2580,11 +2731,17 @@ public sealed class MessagingApplicationService(
             return 0;
         }
 
+        if (cursor.Length > MaxCursorLength)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "The conversation cursor is invalid.");
+        }
+
         try
         {
             var value = Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
             return value.StartsWith("offset:", StringComparison.Ordinal) &&
-                   int.TryParse(value[7..], out var offset) && offset >= 0
+                   int.TryParse(value[7..], out var offset) &&
+                   offset is >= 0 and <= MaxConversationOffset
                 ? offset
                 : throw new FormatException();
         }
@@ -2603,6 +2760,11 @@ public sealed class MessagingApplicationService(
         if (cursor is null)
         {
             return null;
+        }
+
+        if (cursor.Length > MaxCursorLength)
+        {
+            Throw(MessagingErrorCodes.InvalidInput, "The message cursor is invalid.");
         }
 
         try

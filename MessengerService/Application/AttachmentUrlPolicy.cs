@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Text;
+
 namespace MessengerService.Application;
 
 public static class AttachmentUrlPolicy
@@ -36,10 +39,29 @@ public static class AttachmentUrlPolicy
                 return false;
             }
 
-            return leaf.Length > 0 &&
-                   leaf is not "." and not ".." &&
-                   !leaf.Contains('/') &&
-                   !leaf.Contains('\\');
+            if (leaf.Length == 0 || leaf is "." or ".." || leaf.Contains('/') || leaf.Contains('\\'))
+            {
+                return false;
+            }
+
+            foreach (var rune in leaf.EnumerateRunes())
+            {
+                var category = Rune.GetUnicodeCategory(rune);
+                if (rune.Value == '\uFFFD' || category is
+                        UnicodeCategory.Control or
+                        UnicodeCategory.Format or
+                        UnicodeCategory.Surrogate or
+                        UnicodeCategory.PrivateUse or
+                        UnicodeCategory.OtherNotAssigned or
+                        UnicodeCategory.NonSpacingMark or
+                        UnicodeCategory.SpacingCombiningMark or
+                        UnicodeCategory.EnclosingMark)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         return Uri.TryCreate(value, UriKind.Absolute, out var uri) &&

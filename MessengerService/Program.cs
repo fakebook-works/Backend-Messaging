@@ -65,8 +65,8 @@ builder.Services
     .Bind(builder.Configuration.GetSection(MessagingRulesOptions.SectionName))
     .Validate(options => options.MaxGroupParticipants is >= 3 and <= 1_000,
         "Messaging:MaxGroupParticipants must be between 3 and 1000.")
-    .Validate(options => options.MaxMessageLength is >= 1 and <= 10_000,
-        "Messaging:MaxMessageLength must be between 1 and 10000.")
+    .Validate(options => options.MaxMessageLength is >= 1 and <= 20_000,
+        "Messaging:MaxMessageLength must be between 1 and 20000.")
     .Validate(options => options.MaxAttachmentsPerMessage is >= 0 and <= 10,
         "Messaging:MaxAttachmentsPerMessage must be between 0 and 10.")
     .Validate(options => options.MaxAttachmentUrlLength is >= 1 and <= 2_048,

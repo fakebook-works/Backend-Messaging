@@ -10,6 +10,8 @@ public sealed class AttachmentUrlPolicyTests
     [InlineData("/media/files/../secret", false)]
     [InlineData("/media/files/a/b.png", false)]
     [InlineData("/media/files/a.png?token=x", false)]
+    [InlineData("/media/files/a%0A.png", false)]
+    [InlineData("/media/files/zalgo%CC%81.png", false)]
     [InlineData("http://media.example/a.png", false)]
     [InlineData("https://other.example/a.png", false)]
     [InlineData("https://media.example/a.png", true)]

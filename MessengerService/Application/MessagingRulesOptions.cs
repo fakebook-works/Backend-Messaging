@@ -6,7 +6,8 @@ public sealed class MessagingRulesOptions
 
     public int MaxGroupParticipants { get; set; } = 250;
 
-    public int MaxMessageLength { get; set; } = 10_000;
+    /// <summary>Maximum number of Unicode scalar values in a user message.</summary>
+    public int MaxMessageLength { get; set; } = 20_000;
 
     public int MaxAttachmentsPerMessage { get; set; } = 10;
 

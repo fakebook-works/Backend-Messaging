@@ -37,6 +37,13 @@ public sealed class MessagingSubscription
         CancellationToken cancellationToken)
     {
         var userId = userContext.RequireUserId();
+        if (conversationIds is null || conversationIds.Count > MaxSubscribedConversations)
+        {
+            throw new MessagingApplicationException(
+                "TOO_MANY_CONVERSATIONS",
+                $"At most {MaxSubscribedConversations} conversations can be watched by one subscription.");
+        }
+
         var requested = conversationIds.Distinct().ToArray();
         if (requested.Length == 0)
         {
@@ -50,6 +57,13 @@ public sealed class MessagingSubscription
             throw new MessagingApplicationException(
                 "TOO_MANY_CONVERSATIONS",
                 $"At most {MaxSubscribedConversations} conversations can be watched by one subscription.");
+        }
+
+        if (requested.Any(id => id == Guid.Empty))
+        {
+            throw new MessagingApplicationException(
+                MessagingErrorCodes.InvalidInput,
+                "Conversation IDs must be non-empty UUID values.");
         }
 
         // Membership is checked up front for every conversation, exactly as the
